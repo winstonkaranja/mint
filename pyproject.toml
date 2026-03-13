@@ -1,7 +1,7 @@
 [project]
 name = "mint"
 version = "0.1.0"
-description = "Generic email & calendar MCP server supporting Gmail and Outlook"
+description = "Hosted email & calendar MCP server — Gmail and Outlook via a single URL"
 requires-python = ">=3.11"
 dependencies = [
     "fastmcp>=3.0",
