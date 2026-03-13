@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
 
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    provider: Literal["google", "microsoft"] = "google"
     base_url: str = "http://localhost:8000"
+    secret_key: str = ""
 
     # Google OAuth
     google_client_id: str = ""
@@ -19,7 +18,7 @@ class Settings(BaseSettings):
     azure_client_secret: str = ""
     azure_tenant_id: str = ""
 
-    model_config = {"env_prefix": "MINT_", "env_file": ".env"}
+    model_config = {"env_prefix": "MINT_", "env_file": ".env", "extra": "ignore"}
 
 
 @lru_cache

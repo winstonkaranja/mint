@@ -1,94 +1,84 @@
 # Mint: Email & Calendar MCP Server
 
-An MCP server that gives AI assistants access to your email and calendar. Works with Gmail and Outlook via a unified provider interface.
+A hosted MCP server that gives AI assistants access to your email and calendar. One URL, pick Google or Microsoft when you sign in.
+
+## For Users
+
+Add this URL to your AI client:
+
+```
+https://<deployed-domain>/mcp
+```
+
+**Claude.ai** — Settings → MCP Servers → Add → paste the URL.
+
+**ChatGPT** — Settings → Connectors → Create → paste the URL.
+
+**Claude Code** —
+```bash
+claude mcp add mint https://<deployed-domain>/mcp
+```
+
+When prompted, choose "Sign in with Google" or "Sign in with Microsoft" and authorize access.
 
 ## Features
 
 - **9 tools** — read inbox, read/search emails, draft emails, list/get/create/update/delete calendar events
 - **6 prompts** — daily briefing, inbox prioritization, draft reply, schedule review, find availability, email summary
-- **Google + Microsoft** — swap providers with a single env var
+- **Google + Microsoft** — choose your provider at sign-in, no config needed
 - **Drafts only** — email drafts are saved, never sent, so you always review before sending
 
-## Prerequisites
+## For Operators
+
+### Prerequisites
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
-- OAuth credentials for Google and/or Microsoft (see below)
+- OAuth credentials for **both** Google and Microsoft
 
-## Getting OAuth Credentials
+### Getting OAuth Credentials
 
-### Google
+#### Google
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project (or select an existing one)
-3. Enable the **Gmail API** and **Google Calendar API**
-4. Go to **APIs & Services → OAuth consent screen** and configure it
-5. Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID**
-6. Choose **Web application** as the application type
-7. Add `{MINT_BASE_URL}/oauth/google/callback` as an authorized redirect URI (e.g. `http://localhost:8000/oauth/google/callback`)
-8. Copy the **Client ID** and **Client Secret** into your `.env`
+2. Create a project, enable **Gmail API** and **Google Calendar API**
+3. Configure **OAuth consent screen**
+4. Create **OAuth client ID** (Web application)
+5. Add `{MINT_BASE_URL}/auth/callback` as an authorized redirect URI
+6. Copy Client ID and Client Secret
 
-### Microsoft
+#### Microsoft
 
 1. Go to [Azure Portal → App registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade)
-2. Click **New registration**, give it a name, and set the redirect URI to `{MINT_BASE_URL}/oauth/microsoft/callback`
-3. Under **API permissions**, add:
-   - `Mail.Read`
-   - `Mail.ReadWrite`
-   - `Calendars.ReadWrite`
-4. Under **Certificates & secrets**, create a new client secret
-5. Copy the **Application (client) ID**, **Directory (tenant) ID**, and **Client Secret** into your `.env`
+2. Click **New registration**, set redirect URI to `{MINT_BASE_URL}/auth/callback`
+3. Under **Expose an API**, add a scope called `mcp-access`
+4. Under **API permissions**, add `Mail.Read`, `Mail.ReadWrite`, `Calendars.ReadWrite`
+5. Under **Certificates & secrets**, create a client secret
+6. Copy Application (client) ID, Directory (tenant) ID, and Client Secret
 
-## Setup
+### Setup
 
 ```bash
 git clone https://github.com/winstonkaranja/mint.git
 cd mint
 cp .env.example .env
-# Fill in your OAuth credentials in .env
+# Fill in ALL OAuth credentials in .env
 uv sync
 ```
 
-## Running
+### Running locally
 
 ```bash
 uv run python server.py
 ```
 
-The server starts on `http://localhost:8000`.
+Visit `http://localhost:8000` to see the landing page. Add `http://localhost:8000/mcp` to your AI client.
 
-## Connecting to Clients
-
-### claude.ai
-
-Deploy the server publicly (for development, use ngrok):
+### Docker
 
 ```bash
-ngrok http 8000
-```
-
-Then in claude.ai: **Settings → MCP Servers → Add** and enter your server URL (`https://<your-domain>/mcp`).
-
-### ChatGPT
-
-Deploy the server publicly, then:
-
-1. Go to **Settings → Connectors → Create**
-2. Enter your server URL and a name
-3. In each chat, enable via **+ → Developer Mode**
-
-### Claude Code
-
-For local development:
-
-```bash
-claude mcp add mint http://localhost:8000/mcp
-```
-
-Or with a public URL:
-
-```bash
-claude mcp add mint https://<your-domain>/mcp
+docker build -t mint .
+docker run --env-file .env -p 8000:8000 mint
 ```
 
 ## Tools
@@ -118,6 +108,6 @@ claude mcp add mint https://<your-domain>/mcp
 
 ## Architecture
 
-Mint uses a **provider protocol** pattern — `EmailProvider` and `CalendarProvider` define abstract interfaces, with concrete implementations for Google and Microsoft. The active provider is selected by the `MINT_PROVIDER` env var.
+Mint uses a **provider protocol** pattern — `EmailProvider` and `CalendarProvider` define abstract interfaces, with concrete implementations for Google and Microsoft.
 
-Dependencies are injected into tool functions using FastMCP's `Depends()`, which resolves the correct provider at request time based on the authenticated user's OAuth token. The server also acts as an OAuth proxy, handling the authorization flow so clients don't need to manage tokens directly.
+A single `MintProvider` (subclass of FastMCP's `OAuthProxy`) handles OAuth for both providers. During sign-in, users see a provider picker. Their choice is embedded in the JWT claims, so each request is automatically routed to the correct email/calendar implementation.
