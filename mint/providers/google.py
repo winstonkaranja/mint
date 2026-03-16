@@ -84,6 +84,36 @@ class GmailProvider:
         messages = resp.json().get("messages", [])
         return [await self._to_summary(m["id"]) for m in messages]
 
+    async def get_thread_messages(self, email_id: str) -> list[dict]:
+        # Fetch the message to get its threadId
+        resp = await self.client.get(
+            f"{GMAIL_BASE}/messages/{email_id}",
+            headers=self.headers,
+            params={"format": "metadata", "metadataHeaders": ["From"]},
+        )
+        resp.raise_for_status()
+        thread_id = resp.json().get("threadId")
+        if not thread_id:
+            return []
+        # Fetch the full thread
+        resp = await self.client.get(
+            f"{GMAIL_BASE}/threads/{thread_id}",
+            headers=self.headers,
+            params={"format": "full"},
+        )
+        resp.raise_for_status()
+        messages = []
+        for msg in resp.json().get("messages", []):
+            hdrs = {h["name"].lower(): h["value"] for h in msg["payload"]["headers"]}
+            messages.append({
+                "id": msg["id"],
+                "sender": hdrs.get("from", ""),
+                "date": datetime.fromtimestamp(int(msg["internalDate"]) / 1000).isoformat(),
+                "body": self._extract_body(msg["payload"]),
+                "is_read": "UNREAD" not in msg.get("labelIds", []),
+            })
+        return messages
+
     async def _to_summary(self, message_id: str) -> EmailSummary:
         resp = await self.client.get(
             f"{GMAIL_BASE}/messages/{message_id}",
@@ -100,6 +130,7 @@ class GmailProvider:
             date=datetime.fromtimestamp(int(data["internalDate"]) / 1000),
             snippet=data.get("snippet", ""),
             is_read="UNREAD" not in data.get("labelIds", []),
+            thread_id=data.get("threadId"),
         )
 
     @staticmethod

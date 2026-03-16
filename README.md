@@ -23,8 +23,7 @@ When prompted, choose "Sign in with Google" or "Sign in with Microsoft" and auth
 
 ## Features
 
-- **9 tools** — read inbox, read/search emails, draft emails, list/get/create/update/delete calendar events
-- **6 prompts** — daily briefing, inbox prioritization, draft reply, schedule review, find availability, email summary
+- **7 intelligence-gated tools** — server-side priority scoring and email-calendar cross-referencing, so the AI gets 3-10 actionable items instead of 200 raw emails
 - **Google + Microsoft** — choose your provider at sign-in, no config needed
 - **Drafts only** — email drafts are saved, never sent, so you always review before sending
 
@@ -85,29 +84,18 @@ docker run --env-file .env -p 8000:8000 mint
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `read_inbox` | `max_results` (default 20) | Get recent emails from your inbox |
-| `read_email` | `email_id` | Read a specific email by its ID |
-| `search_emails` | `query`, `max_results` (default 20) | Search emails by query string |
-| `draft_email` | `to`, `subject`, `body`, `cc`, `bcc` | Save an email as a draft |
-| `list_events` | `start`, `end`, `max_results` (default 20) | List calendar events in a date range |
-| `get_event` | `event_id` | Get a specific calendar event by ID |
-| `create_event` | `title`, `start`, `end`, `location`, `description`, `attendees` | Create a new calendar event |
-| `update_event` | `event_id`, `title`, `start`, `end`, `location`, `description`, `attendees` | Update an existing calendar event |
-| `delete_event` | `event_id` | Delete a calendar event by ID |
-
-## Prompts
-
-| Prompt | Parameters | Description |
-|--------|-----------|-------------|
-| `daily_briefing` | — | Read inbox and today's calendar. Summarize priorities, flag urgent emails, show schedule. |
-| `prioritize_inbox` | `max_emails` (default 20) | Read inbox, categorize by urgency, explain why. |
-| `draft_reply` | `email_id` | Read the email, draft a professional response, save as draft. |
-| `schedule_review` | `days_ahead` (default 7) | List upcoming events, flag conflicts, suggest prep needed. |
-| `find_availability` | `days_ahead` (default 7) | Analyze calendar for free slots, present options for scheduling. |
-| `email_summary` | `query` | Search emails matching query, summarize the thread/conversation. |
+| `get_daily_brief` | — | Morning snapshot: today's meetings + top emails + cross-referenced highlights |
+| `get_priority_emails` | `limit` (default 10) | Top emails scored 0.0-1.0 by urgency, calendar relevance, and thread activity |
+| `get_email_thread` | `email_id` | Full conversation thread for one email |
+| `draft_email_reply` | `email_id`, `body`, `cc`, `bcc` | Draft a reply (never sends) |
+| `get_upcoming_events` | `days` (default 7) | Calendar enriched with unread email counts from attendees |
+| `create_reminder` | `title`, `start`, `description` | Create a 30-minute personal calendar reminder |
+| `summarize_day` | — | End-of-day: what happened, what's pending, tomorrow's first events |
 
 ## Architecture
 
 Mint uses a **provider protocol** pattern — `EmailProvider` and `CalendarProvider` define abstract interfaces, with concrete implementations for Google and Microsoft.
+
+An **intelligence layer** (`mint/intelligence.py`) sits between the tools and providers. It handles priority scoring, email-calendar cross-referencing, and filtering. Tools call intelligence functions which call providers. Claude gets 3-10 actionable items per tool call instead of raw API responses.
 
 A single `MintProvider` (subclass of FastMCP's `OAuthProxy`) handles OAuth for both providers. During sign-in, users see a provider picker. Their choice is embedded in the JWT claims, so each request is automatically routed to the correct email/calendar implementation.

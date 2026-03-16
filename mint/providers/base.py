@@ -20,6 +20,7 @@ class EmailProvider(Protocol):
     async def search_emails(
         self, query: str, max_results: int = 20
     ) -> list[EmailSummary]: ...
+    async def get_thread_messages(self, email_id: str) -> list[dict]: ...
 
 
 class CalendarProvider(Protocol):

@@ -5,9 +5,7 @@ from starlette.responses import HTMLResponse
 from mint.auth import MintProvider
 from mint.config import get_settings
 from mint.pages import landing_page_html
-from mint.prompts import register_prompts
-from mint.tools.calendar import register_calendar_tools
-from mint.tools.email import register_email_tools
+from mint.tools.smart import register_smart_tools
 
 settings = get_settings()
 auth = MintProvider(settings)
@@ -15,15 +13,15 @@ auth = MintProvider(settings)
 mcp = FastMCP(
     name="Mint",
     instructions=(
-        "Email and calendar tools. "
+        "Email and calendar assistant. Uses server-side intelligence to score, "
+        "filter, and cross-reference emails with calendar events. Each tool "
+        "returns focused, actionable data — not raw inbox dumps. "
         "Works with Gmail or Outlook — the provider is chosen during sign-in."
     ),
     auth=auth,
 )
 
-register_email_tools(mcp)
-register_calendar_tools(mcp)
-register_prompts(mcp)
+register_smart_tools(mcp)
 
 mcp_url = f"{settings.base_url.rstrip('/')}/mcp"
 
