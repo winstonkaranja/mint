@@ -28,7 +28,7 @@ class OutlookProvider:
             params={
                 "$top": max_results,
                 "$orderby": "receivedDateTime desc",
-                "$select": "id,subject,from,receivedDateTime,bodyPreview,isRead",
+                "$select": "id,subject,from,receivedDateTime,bodyPreview,isRead,conversationId",
             },
         )
         resp.raise_for_status()
@@ -86,11 +86,44 @@ class OutlookProvider:
             params={
                 "$search": f'"{query}"',
                 "$top": max_results,
-                "$select": "id,subject,from,receivedDateTime,bodyPreview,isRead",
+                "$select": "id,subject,from,receivedDateTime,bodyPreview,isRead,conversationId",
             },
         )
         resp.raise_for_status()
         return [self._to_summary(m) for m in resp.json().get("value", [])]
+
+    async def get_thread_messages(self, email_id: str) -> list[dict]:
+        # Fetch the message to get its conversationId
+        resp = await self.client.get(
+            f"{GRAPH_BASE}/messages/{email_id}",
+            headers=self.headers,
+            params={"$select": "conversationId"},
+        )
+        resp.raise_for_status()
+        conv_id = resp.json().get("conversationId")
+        if not conv_id:
+            return []
+        # Fetch all messages in the conversation
+        resp = await self.client.get(
+            f"{GRAPH_BASE}/messages",
+            headers=self.headers,
+            params={
+                "$filter": f"conversationId eq '{conv_id}'",
+                "$orderby": "receivedDateTime",
+                "$select": "id,from,receivedDateTime,body,isRead",
+            },
+        )
+        resp.raise_for_status()
+        messages = []
+        for msg in resp.json().get("value", []):
+            messages.append({
+                "id": msg["id"],
+                "sender": self._format_address(msg.get("from", {}).get("emailAddress", {})),
+                "date": msg["receivedDateTime"],
+                "body": msg.get("body", {}).get("content", ""),
+                "is_read": msg.get("isRead", False),
+            })
+        return messages
 
     @staticmethod
     def _to_summary(data: dict) -> EmailSummary:
@@ -103,6 +136,7 @@ class OutlookProvider:
             date=data["receivedDateTime"],
             snippet=data.get("bodyPreview", ""),
             is_read=data.get("isRead", False),
+            thread_id=data.get("conversationId"),
         )
 
     @staticmethod

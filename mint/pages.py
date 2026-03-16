@@ -166,22 +166,19 @@ def landing_page_html(mcp_url: str) -> str:
   <pre>claude mcp add mint {mcp_url}</pre>
 
   <h2>What you get</h2>
-  <div class="grid">
-    <div><strong>read_inbox</strong>Recent emails</div>
-    <div><strong>search_emails</strong>Find by query</div>
-    <div><strong>draft_email</strong>Save a draft</div>
-    <div><strong>list_events</strong>Calendar view</div>
-    <div><strong>create_event</strong>New meeting</div>
-    <div><strong>read_email</strong>Full message</div>
-    <div><strong>get_event</strong>Event details</div>
-    <div><strong>update_event</strong>Change event</div>
-    <div><strong>delete_event</strong>Remove event</div>
-  </div>
-
-  <p style="margin-top:1.5rem; color:#666; font-size:.9rem;">
-    Plus 6 built-in prompts: daily briefing, inbox prioritization, draft reply,
-    schedule review, availability finder, and email summary.
+  <p style="color:#666; font-size:.9rem; margin-bottom:.75rem;">
+    7 intelligence-gated tools. Emails are scored by urgency and cross-referenced
+    with your calendar — you get 3-10 actionable items, not 200 raw emails.
   </p>
+  <div class="grid">
+    <div><strong>get_daily_brief</strong>Morning snapshot</div>
+    <div><strong>get_priority_emails</strong>Top emails by urgency</div>
+    <div><strong>get_email_thread</strong>Full conversation</div>
+    <div><strong>draft_email_reply</strong>Draft a reply</div>
+    <div><strong>get_upcoming_events</strong>Calendar + related emails</div>
+    <div><strong>create_reminder</strong>Personal reminder</div>
+    <div><strong>summarize_day</strong>End-of-day wrap-up</div>
+  </div>
 </section>
 
 <footer>Mint &mdash; open-source MCP server for email &amp; calendar</footer>
