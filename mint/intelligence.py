@@ -21,6 +21,7 @@ _AUTOMATED_SENDER_PATTERNS = {
     "notify", "notifications", "mailer", "info@", "news@",
     "marketing", "promo", "digest", "updates@", "alert@",
     "support@", "billing@", "receipts@", "hello@",
+    "@m.", "@mail.", "@send.", "@post.", "@bulk.",
 }
 
 
