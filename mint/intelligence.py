@@ -49,14 +49,27 @@ _REPLY_REQUESTED_PATTERNS = frozenset({
     "please reply", "your response", "rsvp", "please respond",
     "awaiting your", "waiting for your", "get back to",
 })
-_SECURITY_ALERT_KEYWORDS = frozenset({
-    "security alert", "breach", "leaked", "unauthorized", "suspicious",
-    "compromised", "vulnerability", "incident", "exposed", "secret",
-    "malware", "phishing", "intrusion",
+# Alert detection: requires TOPIC + ACTION co-occurrence
+_SECURITY_TOPICS = frozenset({
+    "security", "password", "credential", "secret", "key", "token",
+    "account", "sign-in", "login",
 })
-_BILLING_ALERT_KEYWORDS = frozenset({
-    "payment failed", "billing alert", "overdue", "past due",
-    "charge", "invoice due", "payment due", "account suspended",
+_SECURITY_ACTIONS = frozenset({
+    "alert", "warning", "detected", "leaked", "exposed", "breach",
+    "unauthorized", "suspicious", "compromised", "vulnerability",
+    "incident", "found", "revoked", "blocked",
+})
+_BILLING_TOPICS = frozenset({
+    "billing", "payment", "invoice", "subscription", "charge", "balance",
+})
+_BILLING_ACTIONS = frozenset({
+    "failed", "overdue", "past due", "suspended", "declined", "due",
+    "alert", "warning", "action required",
+})
+_MARKETING_SIGNALS = frozenset({
+    "upgrade", "premium", "subscribe", "discount", "offer", "trial",
+    "pricing", "plan", "promo", "deal", "save", "off", "free",
+    "limited time", "exclusive",
 })
 
 # DLP (Data Loss Prevention) patterns for outbound draft scanning
@@ -269,20 +282,28 @@ def score_email(
         signals.append("newsletter_ceiling")
 
         # Transactional exception: restore score if subject/snippet contains
-        # keywords indicating a transactional (non-promotional) email
+        # transactional keywords AND no marketing signals (prevents upsell
+        # emails from escaping the newsletter ceiling)
         combined_text = f"{subject_lower} {email.snippet.lower()}"
-        if any(kw in combined_text for kw in _TRANSACTIONAL_KEYWORDS):
+        has_marketing = any(kw in combined_text for kw in _MARKETING_SIGNALS)
+        if not has_marketing and any(kw in combined_text for kw in _TRANSACTIONAL_KEYWORDS):
             score = pre_ceiling_score
             signals.append("transactional_exception")
 
-        # Priority alert floors — security/billing alerts from automated
-        # senders deserve higher scores than promotional emails
-        if any(kw in combined_text for kw in _SECURITY_ALERT_KEYWORDS):
-            score = max(score, 0.55)
-            signals.append("security_alert_floor")
-        elif any(kw in combined_text for kw in _BILLING_ALERT_KEYWORDS):
-            score = max(score, 0.45)
-            signals.append("billing_alert_floor")
+        # Priority alert boosts — additive, not floors, to preserve score
+        # variation. Requires TOPIC + ACTION co-occurrence and no marketing.
+        if not has_marketing:
+            has_sec_topic = any(kw in combined_text for kw in _SECURITY_TOPICS)
+            has_sec_action = any(kw in combined_text for kw in _SECURITY_ACTIONS)
+            has_bill_topic = any(kw in combined_text for kw in _BILLING_TOPICS)
+            has_bill_action = any(kw in combined_text for kw in _BILLING_ACTIONS)
+
+            if has_sec_topic and has_sec_action:
+                score += 0.30
+                signals.append("security_alert_boost")
+            elif has_bill_topic and has_bill_action:
+                score += 0.20
+                signals.append("billing_alert_boost")
 
     # Custom scoring overrides
     if overrides is not None:
