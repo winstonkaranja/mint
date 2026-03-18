@@ -10,6 +10,7 @@ from mint.models import (
     CalendarEvent,
     CreateEventRequest,
     DraftEmailRequest,
+    DraftSummary,
     Email,
     EmailSummary,
     UpdateEventRequest,
@@ -114,6 +115,34 @@ class GmailProvider:
                 "thread_id": thread_id,
             })
         return messages
+
+    async def list_drafts(self, max_results: int = 20) -> list[DraftSummary]:
+        resp = await self.client.get(
+            f"{GMAIL_BASE}/drafts",
+            headers=self.headers,
+            params={"maxResults": max_results},
+        )
+        resp.raise_for_status()
+        drafts = resp.json().get("drafts", [])
+        results: list[DraftSummary] = []
+        for draft in drafts:
+            msg_id = draft["message"]["id"]
+            msg_resp = await self.client.get(
+                f"{GMAIL_BASE}/messages/{msg_id}",
+                headers=self.headers,
+                params={"format": "metadata", "metadataHeaders": ["Subject", "To", "Date"]},
+            )
+            msg_resp.raise_for_status()
+            data = msg_resp.json()
+            headers = {h["name"].lower(): h["value"] for h in data["payload"]["headers"]}
+            results.append(DraftSummary(
+                id=draft["id"],
+                subject=headers.get("subject", ""),
+                to=self._parse_addresses(headers.get("to", "")),
+                snippet=data.get("snippet", ""),
+                date=datetime.fromtimestamp(int(data["internalDate"]) / 1000),
+            ))
+        return results
 
     async def _to_summary(self, message_id: str) -> EmailSummary:
         resp = await self.client.get(
