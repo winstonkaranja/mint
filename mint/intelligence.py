@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from mint.models import (
     CalendarEvent,
@@ -22,7 +23,16 @@ _AUTOMATED_SENDER_PATTERNS = {
     "marketing", "promo", "digest", "updates@", "alert@",
     "support@", "billing@", "receipts@", "hello@",
     "@m.", "@mail.", "@send.", "@post.", "@bulk.",
+    "@e.", "@t.", "@em.", "@msg.", "@campaign.",
+    "notification", "contact@", "team@", "admin@",
 }
+_TRANSACTIONAL_KEYWORDS = {
+    "payment", "billing", "security", "password", "deactivation",
+    "suspension", "verification", "receipt", "charge", "unauthorized", "fraud",
+}
+_PAYMENT_KEYWORDS = {"payment", "invoice", "billing", "receipt", "charge"}
+_DEADLINE_KEYWORDS = {"deadline", "due", "expires", "by end of day", "by eod", "by cob"}
+_DIRECT_QUESTION_PATTERNS = {"can you", "could you", "please review", "your thoughts", "?"}
 
 
 def extract_email_address(sender: str) -> str:
@@ -73,11 +83,11 @@ def score_email(
     if sender_addr in attendee_map:
         for event_title, day_label in attendee_map[sender_addr]:
             if day_label == "today":
-                score += 0.35
+                score += 0.50
                 signals.append(f"calendar_match:today:{event_title}")
                 related_event = event_title
             elif day_label == "tomorrow":
-                score += 0.25
+                score += 0.35
                 signals.append(f"calendar_match:tomorrow:{event_title}")
                 if related_event is None:
                     related_event = event_title
@@ -88,14 +98,24 @@ def score_email(
     keyword_score = 0.0
     for kw in _URGENCY_KEYWORDS:
         if kw in text:
-            keyword_score += 0.05
+            keyword_score += 0.08
             signals.append(f"keyword:{kw}")
-    score += min(keyword_score, 0.15)
+    score += min(keyword_score, 0.25)
 
-    # Direct recipient (heuristic: if sender is not the user, they're likely in To:)
-    # Since we don't have the user's email easily, we use is_read as a proxy —
-    # unread emails the user is in To: for vs CC: is hard to distinguish without
-    # the full headers. We give the base boost for unread here.
+    # Body-text scoring on snippet
+    body_score = 0.0
+    if any(kw in text for kw in _PAYMENT_KEYWORDS):
+        body_score += 0.12
+        signals.append("body:payment_billing")
+    if any(kw in text for kw in _DEADLINE_KEYWORDS):
+        body_score += 0.10
+        signals.append("body:deadline")
+    if any(pat in text for pat in _DIRECT_QUESTION_PATTERNS):
+        body_score += 0.08
+        signals.append("body:direct_question")
+    score += min(body_score, 0.20)
+
+    # Unread base boost
     if not email.is_read:
         score += 0.10
         signals.append("unread")
@@ -105,12 +125,21 @@ def score_email(
         score += 0.10
         signals.append(f"sender_frequency:{sender_counts[sender_addr]}")
 
-    # Unread 4-24h window
+    # Recency boost (unread only, replaces old unread_4_24h block)
     if not email.is_read:
         age = now - email.date
-        if timedelta(hours=4) <= age <= timedelta(hours=24):
-            score += 0.12
-            signals.append("unread_4_24h")
+        if age < timedelta(hours=1):
+            score += 0.20
+            signals.append("recency:1h")
+        elif age < timedelta(hours=4):
+            score += 0.15
+            signals.append("recency:4h")
+        elif age < timedelta(hours=12):
+            score += 0.10
+            signals.append("recency:12h")
+        elif age < timedelta(hours=24):
+            score += 0.05
+            signals.append("recency:24h")
 
     # Thread activity: emails sharing same thread_id
     if email.thread_id and sender_counts.get(f"thread:{email.thread_id}", 0) >= 3:
@@ -135,8 +164,28 @@ def score_email(
         or any(pat in addr_lower for pat in _AUTOMATED_SENDER_PATTERNS)
     )
     if is_automated:
-        score = min(score, 0.25)
+        pre_ceiling_score = score
+        score = min(score, 0.15)
         signals.append("newsletter_ceiling")
+
+        # Transactional exception: restore score if subject/snippet contains
+        # keywords indicating a transactional (non-promotional) email
+        combined_text = f"{subject_lower} {email.snippet.lower()}"
+        if any(kw in combined_text for kw in _TRANSACTIONAL_KEYWORDS):
+            score = pre_ceiling_score
+            signals.append("transactional_exception")
+
+    # Final score and tier assignment
+    score = round(min(score, 1.0), 2)
+
+    if score > 0.8:
+        tier = "critical"
+    elif score > 0.6:
+        tier = "high"
+    elif score > 0.4:
+        tier = "medium"
+    else:
+        tier = "low"
 
     return PriorityEmail(
         id=email.id,
@@ -145,9 +194,10 @@ def score_email(
         date=email.date,
         snippet=email.snippet,
         is_read=email.is_read,
-        score=round(min(score, 1.0), 2),
+        score=score,
         signals=signals,
         related_event=related_event,
+        tier=tier,
     )
 
 
@@ -157,7 +207,12 @@ def rank_emails(
     now: datetime,
     limit: int = 10,
 ) -> list[PriorityEmail]:
-    """Score and rank emails by priority. Returns top `limit` results."""
+    """Score, deduplicate by thread, and rank emails by priority.
+
+    Emails sharing a thread_id are collapsed to the highest-scoring
+    representative, with message_count reflecting the thread size.
+    Emails with no thread_id are treated as standalone.
+    """
     today = now.date()
     attendee_map = build_attendee_map(events, today)
 
@@ -168,15 +223,55 @@ def rank_emails(
         if e.thread_id:
             sender_counts[f"thread:{e.thread_id}"] += 1
 
-    scored = [score_email(e, attendee_map, now, sender_counts) for e in emails]
-    scored.sort(key=lambda p: p.score, reverse=True)
-    return scored[:limit]
+    scored = [
+        (e.thread_id, score_email(e, attendee_map, now, sender_counts))
+        for e in emails
+    ]
+
+    # Group by thread_id; None-keyed emails stay independent
+    thread_groups: dict[str, list[PriorityEmail]] = {}
+    standalone: list[PriorityEmail] = []
+    for thread_id, priority in scored:
+        if thread_id is None:
+            standalone.append(priority)
+        else:
+            thread_groups.setdefault(thread_id, []).append(priority)
+
+    # Collapse each thread to its highest-scoring email
+    deduplicated: list[PriorityEmail] = list(standalone)
+    for group in thread_groups.values():
+        group.sort(key=lambda p: p.score, reverse=True)
+        representative = group[0]
+        representative.message_count = len(group)
+        deduplicated.append(representative)
+
+    deduplicated.sort(key=lambda p: p.score, reverse=True)
+    return deduplicated[:limit]
+
+
+def _format_local_time(dt: datetime, tz: ZoneInfo) -> str:
+    """Format a datetime as e.g. '9:00 AM EAT' in the given timezone.
+
+    Converts to the target timezone, formats with 12-hour clock, strips the
+    leading zero from the hour, and appends the timezone abbreviation.
+    """
+    local_dt = dt.astimezone(tz)
+    time_str = local_dt.strftime("%I:%M %p")
+    if time_str.startswith("0"):
+        time_str = time_str[1:]
+    return f"{time_str} {local_dt.strftime('%Z')}"
 
 
 def enrich_events(
-    events: list[CalendarEvent], emails: list[EmailSummary]
+    events: list[CalendarEvent],
+    emails: list[EmailSummary],
+    tz: ZoneInfo | None = None,
 ) -> list[EnrichedEvent]:
-    """Attach unread-email counts from attendees to each event."""
+    """Attach unread-email counts from attendees to each event.
+
+    If *tz* is provided, populates start_local / end_local with
+    human-readable times in that timezone (e.g. "9:00 AM EAT").
+    """
     # Build set of senders with unread emails
     unread_senders: set[str] = set()
     for e in emails:
@@ -187,6 +282,13 @@ def enrich_events(
     for event in events:
         attendee_addrs = {a.lower().strip() for a in event.attendees}
         unread_count = len(attendee_addrs & unread_senders)
+
+        start_local: str | None = None
+        end_local: str | None = None
+        if tz is not None:
+            start_local = _format_local_time(event.start, tz)
+            end_local = _format_local_time(event.end, tz)
+
         result.append(
             EnrichedEvent(
                 id=event.id,
@@ -198,23 +300,35 @@ def enrich_events(
                 attendees=event.attendees,
                 is_all_day=event.is_all_day,
                 unread_from_attendees=unread_count,
+                start_local=start_local,
+                end_local=end_local,
             )
         )
     return result
 
 
 def generate_highlights(
-    events: list[EnrichedEvent], emails: list[PriorityEmail]
+    events: list[EnrichedEvent],
+    emails: list[PriorityEmail],
+    tz: ZoneInfo | None = None,
 ) -> list[str]:
-    """Generate natural-language highlights for the daily brief."""
+    """Generate natural-language highlights for the daily brief.
+
+    If *tz* is provided, event start times are shown in the user's local
+    timezone (e.g. "9:00 AM EAT") instead of raw UTC.
+    """
     highlights: list[str] = []
 
     # Meeting-related emails
     for event in events:
         if event.unread_from_attendees > 0:
+            if tz is not None:
+                time_str = _format_local_time(event.start, tz)
+            else:
+                time_str = event.start.strftime("%I:%M %p")
             highlights.append(
                 f"{event.unread_from_attendees} unread email(s) from attendees "
-                f"of \"{event.title}\" (starts {event.start.strftime('%I:%M %p')})"
+                f"of \"{event.title}\" (starts {time_str})"
             )
 
     # Top urgent emails

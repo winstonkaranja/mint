@@ -87,6 +87,8 @@ class PriorityEmail(BaseModel):
     score: float
     signals: list[str]
     related_event: str | None = None
+    tier: str = "low"
+    message_count: int = 1
 
 
 class EnrichedEvent(BaseModel):
@@ -99,6 +101,8 @@ class EnrichedEvent(BaseModel):
     attendees: list[str] = []
     is_all_day: bool = False
     unread_from_attendees: int = 0
+    start_local: str | None = None
+    end_local: str | None = None
 
 
 class DailyBrief(BaseModel):
@@ -107,6 +111,7 @@ class DailyBrief(BaseModel):
     priority_emails: list[PriorityEmail]
     pending_thread_count: int
     highlights: list[str]
+    timezone: str = "UTC"
 
 
 class DaySummary(BaseModel):
@@ -117,3 +122,4 @@ class DaySummary(BaseModel):
     pending_emails: list[PriorityEmail]
     tomorrow_first_events: list[EnrichedEvent]
     action_items: list[str]
+    timezone: str = "UTC"
