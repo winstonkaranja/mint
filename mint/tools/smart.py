@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
+import httpx
 from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
 
 from mint.dependencies import get_calendar_provider, get_email_provider
+from mint.errors import (
+    MintToolError,
+    invalid_input,
+    not_found,
+    provider_error,
+    rate_limited,
+)
 from mint.intelligence import (
     enrich_events,
     generate_action_items,
@@ -29,26 +38,51 @@ from mint.models import (
 from mint.providers.base import CalendarProvider, EmailProvider
 
 
+def _resolve_timezone(timezone: str) -> ZoneInfo:
+    """Parse an IANA timezone name, falling back to UTC on invalid input."""
+    try:
+        return ZoneInfo(timezone)
+    except (KeyError, ValueError):
+        return ZoneInfo("UTC")
+
+
+def _raise_for_http_error(exc: httpx.HTTPStatusError, resource_type: str = "", resource_id: str = "") -> None:
+    """Translate an HTTP status error into the appropriate MintToolError."""
+    status = exc.response.status_code
+    if status == 404 and resource_type:
+        raise not_found(resource_type, resource_id) from exc
+    if status == 429:
+        raise rate_limited() from exc
+    raise provider_error(f"HTTP {status}: {exc.response.text}") from exc
+
+
 def register_smart_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(annotations={"readOnlyHint": True})
     async def get_daily_brief(
+        timezone: str = "UTC",
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> DailyBrief:
         """Morning snapshot: today's meetings enriched with related unread emails, top priority emails scored by urgency, and cross-referenced highlights. One call replaces reading inbox + checking calendar."""
-        now = datetime.utcnow()
+        tz = _resolve_timezone(timezone)
+        now = datetime.now(tz)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_end = today_start + timedelta(days=2)  # include tomorrow for scoring
 
-        emails_task = email_provider.get_inbox(max_results=50)
-        events_task = calendar_provider.list_events(today_start, today_end, max_results=30)
-        emails, events = await asyncio.gather(emails_task, events_task)
+        try:
+            emails_task = email_provider.get_inbox(max_results=50)
+            events_task = calendar_provider.list_events(today_start, today_end, max_results=30)
+            emails, events = await asyncio.gather(emails_task, events_task)
+        except httpx.HTTPStatusError as exc:
+            _raise_for_http_error(exc)
+        except Exception as exc:
+            raise provider_error(str(exc)) from exc
 
         priority = rank_emails(emails, events, now, limit=10)
         today_events = [e for e in events if e.start.date() == now.date()]
-        enriched = enrich_events(today_events, emails)
-        highlights = generate_highlights(enriched, priority)
+        enriched = enrich_events(today_events, emails, tz=tz)
+        highlights = generate_highlights(enriched, priority, tz=tz)
 
         # Count distinct threads with unread emails
         unread_threads = {e.thread_id for e in emails if not e.is_read and e.thread_id}
@@ -60,6 +94,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
             priority_emails=priority,
             pending_thread_count=pending_count,
             highlights=highlights,
+            timezone=timezone,
         )
 
     @mcp.tool(annotations={"readOnlyHint": True})
@@ -73,9 +108,14 @@ def register_smart_tools(mcp: FastMCP) -> None:
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_end = today_start + timedelta(days=2)
 
-        emails_task = email_provider.get_inbox(max_results=50)
-        events_task = calendar_provider.list_events(today_start, today_end, max_results=30)
-        emails, events = await asyncio.gather(emails_task, events_task)
+        try:
+            emails_task = email_provider.get_inbox(max_results=50)
+            events_task = calendar_provider.list_events(today_start, today_end, max_results=30)
+            emails, events = await asyncio.gather(emails_task, events_task)
+        except httpx.HTTPStatusError as exc:
+            _raise_for_http_error(exc)
+        except Exception as exc:
+            raise provider_error(str(exc)) from exc
 
         return rank_emails(emails, events, now, limit=limit)
 
@@ -85,9 +125,13 @@ def register_smart_tools(mcp: FastMCP) -> None:
         email_provider: EmailProvider = Depends(get_email_provider),
     ) -> EmailThread:
         """Get the full conversation thread for an email. Returns all messages in the thread with sender, date, and body."""
-        # Get the email first for the subject
-        email = await email_provider.get_email(email_id)
-        raw_messages = await email_provider.get_thread_messages(email_id)
+        try:
+            email = await email_provider.get_email(email_id)
+            raw_messages = await email_provider.get_thread_messages(email_id)
+        except httpx.HTTPStatusError as exc:
+            _raise_for_http_error(exc, resource_type="email", resource_id=email_id)
+        except Exception as exc:
+            raise provider_error(str(exc)) from exc
 
         messages = [
             ThreadMessage(
@@ -119,7 +163,13 @@ def register_smart_tools(mcp: FastMCP) -> None:
         email_provider: EmailProvider = Depends(get_email_provider),
     ) -> str:
         """Draft a reply to an email. Reads the original email, creates a reply draft with Re: subject addressed to the sender. Never sends — the user reviews and sends from their mail client. Returns the draft ID."""
-        original = await email_provider.get_email(email_id)
+        try:
+            original = await email_provider.get_email(email_id)
+        except httpx.HTTPStatusError as exc:
+            _raise_for_http_error(exc, resource_type="email", resource_id=email_id)
+        except Exception as exc:
+            raise provider_error(str(exc)) from exc
+
         subject = original.subject
         if not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
@@ -131,24 +181,37 @@ def register_smart_tools(mcp: FastMCP) -> None:
             cc=cc,
             bcc=bcc,
         )
-        return await email_provider.draft_email(request)
+
+        try:
+            return await email_provider.draft_email(request)
+        except httpx.HTTPStatusError as exc:
+            _raise_for_http_error(exc)
+        except Exception as exc:
+            raise provider_error(str(exc)) from exc
 
     @mcp.tool(annotations={"readOnlyHint": True})
     async def get_upcoming_events(
         days: int = 7,
+        timezone: str = "UTC",
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> list[EnrichedEvent]:
         """Calendar events for the next N days, enriched with unread email counts from attendees. Shows which meetings have related unread emails so you can prepare."""
-        now = datetime.utcnow()
+        tz = _resolve_timezone(timezone)
+        now = datetime.now(tz)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=days)
 
-        emails_task = email_provider.get_inbox(max_results=50)
-        events_task = calendar_provider.list_events(start, end, max_results=50)
-        emails, events = await asyncio.gather(emails_task, events_task)
+        try:
+            emails_task = email_provider.get_inbox(max_results=50)
+            events_task = calendar_provider.list_events(start, end, max_results=50)
+            emails, events = await asyncio.gather(emails_task, events_task)
+        except httpx.HTTPStatusError as exc:
+            _raise_for_http_error(exc)
+        except Exception as exc:
+            raise provider_error(str(exc)) from exc
 
-        return enrich_events(events, emails)
+        return enrich_events(events, emails, tz=tz)
 
     @mcp.tool()
     async def create_reminder(
@@ -159,7 +222,11 @@ def register_smart_tools(mcp: FastMCP) -> None:
     ) -> CalendarEvent:
         """Create a personal calendar reminder. Sets a 30-minute event with no attendees. Use for tasks, follow-ups, or prep reminders."""
         if not title.strip():
-            raise ValueError("Reminder title cannot be empty")
+            raise invalid_input(
+                "Reminder title cannot be empty",
+                "Provide a non-empty title string",
+            )
+
         request = CreateEventRequest(
             title=title,
             start=start,
@@ -167,31 +234,44 @@ def register_smart_tools(mcp: FastMCP) -> None:
             description=description,
             attendees=[],
         )
-        return await calendar_provider.create_event(request)
+
+        try:
+            return await calendar_provider.create_event(request)
+        except httpx.HTTPStatusError as exc:
+            _raise_for_http_error(exc)
+        except Exception as exc:
+            raise provider_error(str(exc)) from exc
 
     @mcp.tool(annotations={"readOnlyHint": True})
     async def summarize_day(
+        timezone: str = "UTC",
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> DaySummary:
         """End-of-day summary: emails received, unread count, today's meetings with attendee email activity, pending high-priority emails, tomorrow's first events, and suggested action items."""
-        now = datetime.utcnow()
+        tz = _resolve_timezone(timezone)
+        now = datetime.now(tz)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_end = today_start + timedelta(days=1)
         tomorrow_end = today_end + timedelta(days=1)
 
-        emails_task = email_provider.get_inbox(max_results=50)
-        today_events_task = calendar_provider.list_events(today_start, today_end, max_results=30)
-        tomorrow_events_task = calendar_provider.list_events(today_end, tomorrow_end, max_results=5)
-        emails, today_events, tomorrow_events = await asyncio.gather(
-            emails_task, today_events_task, tomorrow_events_task
-        )
+        try:
+            emails_task = email_provider.get_inbox(max_results=50)
+            today_events_task = calendar_provider.list_events(today_start, today_end, max_results=30)
+            tomorrow_events_task = calendar_provider.list_events(today_end, tomorrow_end, max_results=5)
+            emails, today_events, tomorrow_events = await asyncio.gather(
+                emails_task, today_events_task, tomorrow_events_task
+            )
+        except httpx.HTTPStatusError as exc:
+            _raise_for_http_error(exc)
+        except Exception as exc:
+            raise provider_error(str(exc)) from exc
 
         # Include tomorrow's events for scoring
         all_events = today_events + tomorrow_events
         priority = rank_emails(emails, all_events, now, limit=10)
-        enriched_today = enrich_events(today_events, emails)
-        enriched_tomorrow = enrich_events(tomorrow_events, emails)
+        enriched_today = enrich_events(today_events, emails, tz=tz)
+        enriched_tomorrow = enrich_events(tomorrow_events, emails, tz=tz)
 
         pending = [e for e in priority if not e.is_read and e.score >= 0.40]
         action_items = generate_action_items(pending, enriched_tomorrow)
@@ -206,4 +286,5 @@ def register_smart_tools(mcp: FastMCP) -> None:
             pending_emails=pending,
             tomorrow_first_events=enriched_tomorrow,
             action_items=action_items,
+            timezone=timezone,
         )
