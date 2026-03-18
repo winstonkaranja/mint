@@ -67,6 +67,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
         """Morning snapshot: today's meetings enriched with related unread emails, top priority emails scored by urgency, and cross-referenced highlights. One call replaces reading inbox + checking calendar."""
         tz = _resolve_timezone(timezone)
         now = datetime.now(tz)
+        now_utc = datetime.utcnow()  # naive UTC for scoring (email dates are naive)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_end = today_start + timedelta(days=2)  # include tomorrow for scoring
 
@@ -79,7 +80,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             raise provider_error(str(exc)) from exc
 
-        priority = rank_emails(emails, events, now, limit=10)
+        priority = rank_emails(emails, events, now_utc, limit=10)
         today_events = [e for e in events if e.start.date() == now.date()]
         enriched = enrich_events(today_events, emails, tz=tz)
         highlights = generate_highlights(enriched, priority, tz=tz)
@@ -251,6 +252,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
         """End-of-day summary: emails received, unread count, today's meetings with attendee email activity, pending high-priority emails, tomorrow's first events, and suggested action items."""
         tz = _resolve_timezone(timezone)
         now = datetime.now(tz)
+        now_utc = datetime.utcnow()  # naive UTC for scoring (email dates are naive)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_end = today_start + timedelta(days=1)
         tomorrow_end = today_end + timedelta(days=1)
@@ -269,7 +271,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
 
         # Include tomorrow's events for scoring
         all_events = today_events + tomorrow_events
-        priority = rank_emails(emails, all_events, now, limit=10)
+        priority = rank_emails(emails, all_events, now_utc, limit=10)
         enriched_today = enrich_events(today_events, emails, tz=tz)
         enriched_tomorrow = enrich_events(tomorrow_events, emails, tz=tz)
 
