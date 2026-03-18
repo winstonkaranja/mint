@@ -122,6 +122,7 @@ class OutlookProvider:
                 "date": msg["receivedDateTime"],
                 "body": msg.get("body", {}).get("content", ""),
                 "is_read": msg.get("isRead", False),
+                "thread_id": conv_id,
             })
         return messages
 

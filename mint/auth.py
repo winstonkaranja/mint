@@ -4,6 +4,10 @@ Subclasses OAuthProxy to replace the consent page with a provider picker,
 dynamically route to Google or Microsoft OAuth, and embed the chosen
 provider in JWT claims so downstream dependencies can resolve the correct
 email/calendar implementation.
+
+Enterprise SSO (OIDC) is supported as a third provider when configured via
+the MINT_SSO_* environment variables.  When SSO is in "enforce-only" mode
+the consumer Google/Microsoft buttons are hidden.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode
 
+import httpx
 from authlib.integrations.httpx_client import AsyncOAuth2Client
 from mcp.server.auth.provider import RefreshToken
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
@@ -40,6 +45,7 @@ from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.ui import create_secure_html_response
 
 from mint.config import Settings
+from mint.oidc import OIDCDiscoveryCache, OIDCDiscoveryError, validate_id_token
 from mint.pages import provider_picker_html
 
 logger = get_logger(__name__)
@@ -51,6 +57,22 @@ _current_provider_var: contextvars.ContextVar[str | None] = contextvars.ContextV
 
 # Maximum age (seconds) for entries in _provider_choices before eviction.
 _PROVIDER_CHOICE_TTL = 20 * 60  # 20 minutes (slightly longer than txn TTL)
+
+# Standard OIDC scopes requested during SSO authorization.
+_SSO_OIDC_SCOPES = ["openid", "email", "profile"]
+
+# Human-readable labels for well-known SSO provider slugs.
+_SSO_PROVIDER_LABELS: dict[str, str] = {
+    "okta": "Okta",
+    "azure_ad": "Azure AD",
+    "google_workspace": "Google Workspace",
+}
+
+
+def _sso_provider_label(settings: Settings) -> str:
+    """Derive a human-readable label for the SSO button."""
+    slug = (settings.sso_provider or "").strip().lower()
+    return _SSO_PROVIDER_LABELS.get(slug, slug.replace("_", " ").title() or "SSO")
 
 
 # ---------------------------------------------------------------------------
@@ -161,17 +183,56 @@ class MintTokenVerifier(TokenVerifier):
 
 
 class MintProvider(OAuthProxy):
-    """OAuthProxy subclass that lets the user pick Google or Microsoft."""
+    """OAuthProxy subclass that lets the user pick Google, Microsoft, or SSO."""
 
     def __init__(self, settings: Settings):
+        self._settings = settings
         self._configs = _build_configs(settings)
 
-        # Per-transaction provider choice: maps txn_id → (provider, timestamp).
+        # Per-transaction provider choice: maps txn_id -> (provider, timestamp).
         # Entries are evicted in _evict_stale_choices() on every write.
         self._provider_choices: dict[str, tuple[str, float]] = {}
 
         # Serialises credential-swapping in exchange_refresh_token.
         self._credential_lock = asyncio.Lock()
+
+        # --- SSO / OIDC setup ---
+        self._sso_enabled = settings.sso_enabled and bool(
+            settings.sso_issuer_url
+            and settings.sso_client_id
+            and settings.sso_client_secret
+        )
+        self._sso_enforce_only = self._sso_enabled and settings.sso_enforce_only
+        self._sso_label = _sso_provider_label(settings)
+
+        self._oidc_cache: OIDCDiscoveryCache | None = None
+        if self._sso_enabled:
+            assert settings.sso_issuer_url is not None
+            self._oidc_cache = OIDCDiscoveryCache(settings.sso_issuer_url)
+
+            # Register a placeholder SSO config.  The auth/token endpoints
+            # are populated lazily from OIDC discovery -- the dataclass fields
+            # store empty strings as placeholders until first use.
+            assert settings.sso_client_id is not None
+            assert settings.sso_client_secret is not None
+            self._configs["sso"] = UpstreamConfig(
+                name="sso",
+                auth_endpoint="",  # resolved dynamically via OIDC discovery
+                token_endpoint="",  # resolved dynamically via OIDC discovery
+                client_id=settings.sso_client_id,
+                client_secret=settings.sso_client_secret,
+                authorize_scopes=_SSO_OIDC_SCOPES,
+                token_exchange_scopes=[],
+                refresh_scopes=_SSO_OIDC_SCOPES,
+                extra_authorize_params={"prompt": "consent"},
+            )
+
+            logger.info(
+                "SSO enabled for %s (issuer: %s, enforce_only: %s)",
+                self._sso_label,
+                settings.sso_issuer_url,
+                self._sso_enforce_only,
+            )
 
         # --- build composite verifier ---
         google_verifier = GoogleTokenVerifier(required_scopes=GOOGLE_SCOPES)
@@ -262,7 +323,13 @@ class MintProvider(OAuthProxy):
         txn_model.csrf_expires_at = csrf_expires_at
         await self._transaction_store.put(key=txn_id, value=txn_model, ttl=15 * 60)
 
-        html = provider_picker_html(txn_id, csrf_token)
+        html = provider_picker_html(
+            txn_id,
+            csrf_token,
+            sso_enabled=self._sso_enabled,
+            sso_label=self._sso_label,
+            sso_enforce_only=self._sso_enforce_only,
+        )
         response = create_secure_html_response(html)
         self._set_list_cookie(
             response,
@@ -275,7 +342,16 @@ class MintProvider(OAuthProxy):
     async def _submit_consent(
         self, request: Request
     ) -> RedirectResponse | HTMLResponse:
-        """Intercept the POST to capture the provider choice, then delegate."""
+        """Intercept the POST to capture the provider choice, then delegate.
+
+        For non-SSO providers we delegate entirely to the parent's
+        ``_submit_consent`` which calls our ``_build_upstream_authorize_url``
+        override (synchronous, returns a real URL).
+
+        For SSO, the authorization endpoint must be fetched via async OIDC
+        discovery, so we replicate the relevant parent logic here to avoid
+        the sync/async mismatch.
+        """
         form = await request.form()
         txn_id = str(form.get("txn_id", ""))
         provider = str(form.get("provider", "google"))
@@ -283,7 +359,76 @@ class MintProvider(OAuthProxy):
             provider = "google"
         if txn_id:
             self._store_choice(txn_id, provider)
-        return await super()._submit_consent(request)
+
+        if provider != "sso":
+            return await super()._submit_consent(request)
+
+        # --- SSO-specific consent approval ---
+        # We must resolve the IdP URL asynchronously, so we inline the
+        # parent's approval logic here.
+        if not txn_id:
+            return create_secure_html_response(
+                "<h1>Error</h1><p>Invalid or expired transaction</p>",
+                status_code=400,
+            )
+
+        txn_model = await self._transaction_store.get(key=txn_id)
+        if not txn_model:
+            return create_secure_html_response(
+                "<h1>Error</h1><p>Invalid or expired transaction</p>",
+                status_code=400,
+            )
+
+        txn = txn_model.model_dump()
+
+        # CSRF validation
+        csrf_token = str(form.get("csrf_token", ""))
+        expected_csrf = txn.get("csrf_token")
+        expires_at = float(txn.get("csrf_expires_at") or 0)
+        if not expected_csrf or csrf_token != expected_csrf or time.time() > expires_at:
+            return create_secure_html_response(
+                "<h1>Error</h1><p>Invalid or expired consent token</p>",
+                status_code=400,
+            )
+
+        # Record consent approval cookie (mirrors parent)
+        client_key = self._make_client_key(
+            txn["client_id"], txn["client_redirect_uri"]
+        )
+        approved = set(self._decode_list_cookie(request, "MCP_APPROVED_CLIENTS"))
+        approved.add(client_key)
+        approved_b64 = self._encode_list_cookie(sorted(approved))
+
+        consent_token = secrets.token_urlsafe(32)
+        txn_model.consent_token = consent_token
+        await self._transaction_store.put(key=txn_id, value=txn_model, ttl=15 * 60)
+
+        # Build the SSO authorize URL asynchronously.
+        try:
+            upstream_url = await self._build_sso_authorize_url_async(txn_id, txn)
+        except OIDCDiscoveryError as exc:
+            logger.error("SSO OIDC discovery failed: %s", exc)
+            html = create_error_html(
+                error_title="SSO Error",
+                error_message=(
+                    "Could not reach your organisation's identity provider. "
+                    "Please try again later."
+                ),
+            )
+            return HTMLResponse(content=html, status_code=502)
+
+        response = RedirectResponse(url=upstream_url, status_code=302)
+        self._set_list_cookie(
+            response, "MCP_APPROVED_CLIENTS", approved_b64, max_age=365 * 24 * 3600
+        )
+        self._set_list_cookie(
+            response,
+            "MCP_CONSENT_STATE",
+            self._encode_list_cookie([]),
+            max_age=60,
+        )
+        self._set_consent_binding_cookie(request, response, txn_id, consent_token)
+        return response
 
     # ------------------------------------------------------------------
     # Build upstream authorize URL for the chosen provider
@@ -293,6 +438,20 @@ class MintProvider(OAuthProxy):
         self, txn_id: str, transaction: dict[str, Any]
     ) -> str:
         provider = self._get_choice(txn_id)
+
+        # SSO requires async OIDC discovery; the authorize URL is built
+        # in _submit_consent / _build_sso_authorize_url_async instead.
+        # This branch should not be reached because _submit_consent
+        # handles SSO before calling the parent.  Return a safe fallback
+        # that will surface clearly if it does get used.
+        if provider == "sso":
+            logger.warning(
+                "_build_upstream_authorize_url called for SSO provider "
+                "(txn_id=%s) -- this indicates an unexpected code path",
+                txn_id,
+            )
+            return f"{str(self.base_url).rstrip('/')}/consent?txn_id={txn_id}&error=sso_sync_fallback"
+
         config = self._configs[provider]
 
         query: dict[str, Any] = {
@@ -324,22 +483,111 @@ class MintProvider(OAuthProxy):
         sep = "&" if "?" in config.auth_endpoint else "?"
         return f"{config.auth_endpoint}{sep}{urlencode(query)}"
 
+    async def _build_sso_authorize_url_async(
+        self, txn_id: str, transaction: dict[str, Any]
+    ) -> str:
+        """Construct the SSO authorize URL using OIDC discovery (async)."""
+        assert self._oidc_cache is not None
+        config = self._configs["sso"]
+        auth_endpoint = await self._oidc_cache.authorization_endpoint()
+
+        query: dict[str, Any] = {
+            "response_type": "code",
+            "client_id": config.client_id,
+            "redirect_uri": (
+                f"{str(self.base_url).rstrip('/')}{self._redirect_path}"
+            ),
+            "state": txn_id,
+            "scope": " ".join(config.authorize_scopes),
+        }
+
+        verifier = transaction.get("proxy_code_verifier")
+        if verifier:
+            digest = hashlib.sha256(verifier.encode()).digest()
+            challenge = urlsafe_b64encode(digest).decode().rstrip("=")
+            query["code_challenge"] = challenge
+            query["code_challenge_method"] = "S256"
+
+        if resource := transaction.get("resource"):
+            query["resource"] = resource
+
+        if config.extra_authorize_params:
+            query.update(config.extra_authorize_params)
+
+        sep = "&" if "?" in auth_endpoint else "?"
+        return f"{auth_endpoint}{sep}{urlencode(query)}"
+
     # ------------------------------------------------------------------
     # Scope preparation hooks (called by parent during token exchange)
     # ------------------------------------------------------------------
 
     def _prepare_scopes_for_token_exchange(self, scopes: list[str]) -> list[str]:
-        if _current_provider_var.get() == "microsoft":
+        provider = _current_provider_var.get()
+        if provider == "microsoft":
             return self._configs["microsoft"].token_exchange_scopes
+        if provider == "sso":
+            return self._configs["sso"].token_exchange_scopes
         return scopes
 
     def _prepare_scopes_for_upstream_refresh(self, scopes: list[str]) -> list[str]:
-        if _current_provider_var.get() == "microsoft":
+        provider = _current_provider_var.get()
+        if provider == "microsoft":
             return self._configs["microsoft"].refresh_scopes
+        if provider == "sso":
+            return self._configs["sso"].refresh_scopes
         return scopes
 
     # ------------------------------------------------------------------
-    # IdP callback — override to use provider-specific credentials
+    # SSO token exchange helpers
+    # ------------------------------------------------------------------
+
+    async def _sso_token_exchange(
+        self, code: str, redirect_uri: str, code_verifier: str | None
+    ) -> dict[str, Any]:
+        """Exchange an authorization code with the SSO IdP's token endpoint.
+
+        Returns the full token response dict (access_token, id_token, etc.).
+        """
+        assert self._oidc_cache is not None
+        config = self._configs["sso"]
+        token_endpoint = await self._oidc_cache.token_endpoint()
+
+        payload: dict[str, str] = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": config.client_id,
+            "client_secret": config.client_secret,
+        }
+        if code_verifier:
+            payload["code_verifier"] = code_verifier
+
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+            response = await client.post(token_endpoint, data=payload)
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"SSO token exchange failed ({response.status_code}): "
+                f"{response.text[:500]}"
+            )
+
+        return response.json()
+
+    async def _validate_sso_id_token(self, id_token_raw: str) -> dict[str, Any]:
+        """Validate an SSO ID token and return its claims."""
+        assert self._oidc_cache is not None
+        assert self._settings.sso_issuer_url is not None
+        assert self._settings.sso_client_id is not None
+
+        return await validate_id_token(
+            id_token_raw,
+            self._oidc_cache,
+            client_id=self._settings.sso_client_id,
+            issuer_url=self._settings.sso_issuer_url,
+        )
+
+    # ------------------------------------------------------------------
+    # IdP callback -- override to use provider-specific credentials
     # ------------------------------------------------------------------
 
     async def _handle_idp_callback(
@@ -408,36 +656,61 @@ class MintProvider(OAuthProxy):
             config = self._configs[provider_name]
             _token = _current_provider_var.set(provider_name)
 
-            oauth_client = AsyncOAuth2Client(
-                client_id=config.client_id,
-                client_secret=config.client_secret,
-                token_endpoint_auth_method=self._token_endpoint_auth_method,
-                timeout=HTTP_TIMEOUT_SECONDS,
-            )
-
             try:
                 redirect_uri = (
                     f"{str(self.base_url).rstrip('/')}{self._redirect_path}"
                 )
-                token_params: dict[str, Any] = {
-                    "url": config.token_endpoint,
-                    "code": idp_code,
-                    "redirect_uri": redirect_uri,
-                }
-
                 verifier = transaction.get("proxy_code_verifier")
-                if verifier:
-                    token_params["code_verifier"] = verifier
 
-                exchange_scopes = self._prepare_scopes_for_token_exchange(
-                    transaction.get("scopes") or []
-                )
-                if exchange_scopes:
-                    token_params["scope"] = " ".join(exchange_scopes)
+                if provider_name == "sso":
+                    # SSO path: exchange code via httpx, then validate the
+                    # ID token against the issuer's JWKS.
+                    idp_tokens: dict[str, Any] = await self._sso_token_exchange(
+                        code=idp_code,
+                        redirect_uri=redirect_uri,
+                        code_verifier=verifier,
+                    )
 
-                idp_tokens: dict[str, Any] = await oauth_client.fetch_token(
-                    **token_params
-                )
+                    id_token_raw = idp_tokens.get("id_token")
+                    if id_token_raw:
+                        try:
+                            id_claims = await self._validate_sso_id_token(
+                                id_token_raw
+                            )
+                            idp_tokens["_sso_id_claims"] = id_claims
+                        except OIDCDiscoveryError as exc:
+                            logger.warning(
+                                "SSO ID token validation failed: %s", exc
+                            )
+                    else:
+                        logger.warning("SSO token response missing id_token")
+
+                else:
+                    # Google / Microsoft path -- use authlib.
+                    oauth_client = AsyncOAuth2Client(
+                        client_id=config.client_id,
+                        client_secret=config.client_secret,
+                        token_endpoint_auth_method=self._token_endpoint_auth_method,
+                        timeout=HTTP_TIMEOUT_SECONDS,
+                    )
+
+                    token_params: dict[str, Any] = {
+                        "url": config.token_endpoint,
+                        "code": idp_code,
+                        "redirect_uri": redirect_uri,
+                    }
+
+                    if verifier:
+                        token_params["code_verifier"] = verifier
+
+                    exchange_scopes = self._prepare_scopes_for_token_exchange(
+                        transaction.get("scopes") or []
+                    )
+                    if exchange_scopes:
+                        token_params["scope"] = " ".join(exchange_scopes)
+
+                    idp_tokens = await oauth_client.fetch_token(**token_params)
+
             except Exception as e:
                 logger.error("IdP token exchange failed: %s", e)
                 html = create_error_html(
@@ -528,6 +801,11 @@ class MintProvider(OAuthProxy):
         provider = await self._detect_refresh_provider(refresh_token.token)
         config = self._configs[provider]
 
+        # SSO token endpoint must be resolved from OIDC discovery.
+        token_endpoint = config.token_endpoint
+        if provider == "sso" and self._oidc_cache is not None:
+            token_endpoint = await self._oidc_cache.token_endpoint()
+
         # ContextVar is per-task, so no lock needed for _current_provider_var.
         # The credential swap on instance attributes still needs the lock to
         # serialise against concurrent refreshes.
@@ -542,7 +820,7 @@ class MintProvider(OAuthProxy):
                 )
                 self._upstream_client_id = config.client_id
                 self._upstream_client_secret = SecretStr(config.client_secret)
-                self._upstream_token_endpoint = config.token_endpoint
+                self._upstream_token_endpoint = token_endpoint
                 self._extra_token_params = {}
                 try:
                     return await super().exchange_refresh_token(
@@ -565,6 +843,23 @@ class MintProvider(OAuthProxy):
     async def _extract_upstream_claims(
         self, idp_tokens: dict[str, Any]
     ) -> dict[str, Any] | None:
+        """Extract user-identifying claims from upstream IdP tokens.
+
+        These claims are embedded in the FastMCP JWT under "upstream_claims"
+        and serve two critical multi-tenant isolation purposes:
+
+        1. **User identity**: Every JWT contains `sub` and `email` regardless
+           of provider, enabling audit logging and access control decisions
+           without additional API calls.
+
+        2. **Provider routing**: The `provider` claim tells downstream
+           dependencies which email/calendar implementation to instantiate.
+
+        For Microsoft, claims are extracted from the Azure AD JWT access token.
+        For Google, claims are extracted from the OIDC id_token (returned when
+        the `openid` scope is requested). This ensures parity between providers
+        -- both embed user identity at token issuance time.
+        """
         access_token = idp_tokens.get("access_token", "")
         provider = idp_tokens.get(
             "_mint_provider", self._detect_provider(access_token)
@@ -572,7 +867,25 @@ class MintProvider(OAuthProxy):
 
         claims: dict[str, Any] = {"provider": provider}
 
-        if provider == "microsoft":
+        if provider == "sso":
+            # Prefer validated ID token claims stashed during the callback.
+            id_claims = idp_tokens.get("_sso_id_claims", {})
+            for key in ("sub", "email", "name", "preferred_username"):
+                if key in id_claims:
+                    claims[key] = id_claims[key]
+
+            # Fallback: if the access token is a JWT, try extracting claims
+            # from it (some enterprise IdPs issue JWT access tokens).
+            if "sub" not in claims and access_token.count(".") == 2:
+                try:
+                    payload = decode_jwt_payload(access_token)
+                    for key in ("sub", "email", "name", "preferred_username"):
+                        if key in payload and key not in claims:
+                            claims[key] = payload[key]
+                except Exception:
+                    pass
+
+        elif provider == "microsoft":
             try:
                 payload = decode_jwt_payload(access_token)
                 for key in (
@@ -584,9 +897,19 @@ class MintProvider(OAuthProxy):
             except Exception:
                 pass
         else:
-            # For Google, the verifier already extracts user info.  We just
-            # record the provider so dependencies can route correctly.
-            pass
+            # Google returns an id_token when the `openid` scope is requested.
+            # Decode it (without signature verification -- we received it
+            # directly from Google's token endpoint over TLS) to extract user
+            # identity claims for embedding in the FastMCP JWT.
+            id_token = idp_tokens.get("id_token", "")
+            if id_token:
+                try:
+                    payload = decode_jwt_payload(id_token)
+                    for key in ("sub", "email", "name", "picture"):
+                        if key in payload:
+                            claims[key] = payload[key]
+                except Exception:
+                    logger.debug("Failed to decode Google id_token for claims extraction")
 
         return claims
 
@@ -595,7 +918,25 @@ class MintProvider(OAuthProxy):
     # ------------------------------------------------------------------
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        """Augment the validated AccessToken with upstream_claims from our JWT."""
+        """Validate the FastMCP JWT and augment AccessToken with upstream_claims.
+
+        Multi-tenant isolation is enforced through a two-layer validation chain:
+
+        1. **FastMCP JWT verification** (this layer): Verifies HS256 signature,
+           expiry (`exp`), issuer (`iss`), and audience (`aud`). Extracts the
+           `upstream_claims` embedded at issuance time (containing `sub`,
+           `email`, and `provider`).
+
+        2. **Upstream token verification** (parent `OAuthProxy.load_access_token`):
+           Looks up the real upstream access token via JTI mapping and validates
+           it with the actual provider (Google tokeninfo API or Azure JWKS).
+           This ensures the upstream token has not been revoked.
+
+        Both layers must pass for the request to proceed. The upstream access
+        token is then used by provider instances (see `dependencies.py`) to
+        call Gmail/Outlook/Calendar APIs, ensuring each user can only access
+        their own data.
+        """
         try:
             payload = self.jwt_issuer.verify_token(token)
             upstream_claims = payload.get("upstream_claims") or {}

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 from email.mime.text import MIMEText
 
 import httpx
@@ -111,6 +111,7 @@ class GmailProvider:
                 "date": datetime.fromtimestamp(int(msg["internalDate"]) / 1000).isoformat(),
                 "body": self._extract_body(msg["payload"]),
                 "is_read": "UNREAD" not in msg.get("labelIds", []),
+                "thread_id": thread_id,
             })
         return messages
 
@@ -152,6 +153,17 @@ class GmailProvider:
         return [a.strip() for a in raw.split(",")]
 
 
+def _to_rfc3339_utc(dt: datetime) -> str:
+    """Format a datetime as an RFC 3339 string with 'Z' suffix.
+
+    If the datetime is timezone-aware, it is converted to UTC first.
+    If naive, it is assumed to already represent UTC.
+    """
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.isoformat() + "Z"
+
+
 class GoogleCalendarProvider:
     def __init__(self, client: httpx.AsyncClient, token: str) -> None:
         self.client = client
@@ -164,8 +176,8 @@ class GoogleCalendarProvider:
             f"{GCAL_BASE}/events",
             headers=self.headers,
             params={
-                "timeMin": start.isoformat() + "Z",
-                "timeMax": end.isoformat() + "Z",
+                "timeMin": _to_rfc3339_utc(start),
+                "timeMax": _to_rfc3339_utc(end),
                 "maxResults": max_results,
                 "singleEvents": True,
                 "orderBy": "startTime",
