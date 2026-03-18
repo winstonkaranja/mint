@@ -58,7 +58,7 @@ def _resolve_timezone(timezone: str) -> ZoneInfo:
 def _raise_for_http_error(exc: httpx.HTTPStatusError, resource_type: str = "", resource_id: str = "") -> None:
     """Translate an HTTP status error into the appropriate MintToolError."""
     status = exc.response.status_code
-    if status == 404 and resource_type:
+    if status in (404, 400) and resource_type:
         raise not_found(resource_type, resource_id) from exc
     if status == 429:
         raise rate_limited() from exc

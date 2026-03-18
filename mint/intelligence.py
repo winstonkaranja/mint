@@ -45,6 +45,10 @@ _POSITIVE_SENTIMENT = {
     "thank you", "great news", "congratulations", "well done", "approved",
     "good news", "pleased to",
 }
+_REPLY_REQUESTED_PATTERNS = frozenset({
+    "please reply", "your response", "rsvp", "please respond",
+    "awaiting your", "waiting for your", "get back to",
+})
 
 # DLP (Data Loss Prevention) patterns for outbound draft scanning
 _DLP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -159,7 +163,7 @@ def score_email(
     keyword_score = 0.0
     for kw in _URGENCY_KEYWORDS:
         if kw in text:
-            keyword_score += 0.08
+            keyword_score += 0.12
             signals.append(f"keyword:{kw}")
     score += min(keyword_score, 0.25)
 
@@ -174,7 +178,12 @@ def score_email(
     if any(pat in text for pat in _DIRECT_QUESTION_PATTERNS):
         body_score += 0.08
         signals.append("body:direct_question")
-    score += min(body_score, 0.20)
+    score += min(body_score, 0.30)
+
+    # Reply-requested signal
+    if any(pat in text for pat in _REPLY_REQUESTED_PATTERNS):
+        score += 0.10
+        signals.append("reply_requested")
 
     # Sentiment signals
     has_negative = any(kw in text for kw in _NEGATIVE_SENTIMENT)
@@ -190,35 +199,42 @@ def score_email(
         score += 0.10
         signals.append("unread")
 
-    # Active thread: sender frequency as proxy
-    if sender_counts[sender_addr] >= 3:
+    # Sender frequency (graduated)
+    freq = sender_counts[sender_addr]
+    if freq >= 7:
+        score += 0.20
+        signals.append(f"sender_frequency:{freq}:high")
+    elif freq >= 5:
+        score += 0.15
+        signals.append(f"sender_frequency:{freq}:medium")
+    elif freq >= 3:
         score += 0.10
-        signals.append(f"sender_frequency:{sender_counts[sender_addr]}")
+        signals.append(f"sender_frequency:{freq}:low")
 
     # VIP sender boost
     if sender_addr in vip_senders:
         score += 0.10
         signals.append("vip_sender")
 
-    # Recency boost (unread only, replaces old unread_4_24h block)
-    if not email.is_read:
-        age = now - email.date
-        if age < timedelta(hours=1):
-            score += 0.20
-            signals.append("recency:1h")
-        elif age < timedelta(hours=4):
-            score += 0.15
-            signals.append("recency:4h")
-        elif age < timedelta(hours=12):
-            score += 0.10
-            signals.append("recency:12h")
-        elif age < timedelta(hours=24):
-            score += 0.05
-            signals.append("recency:24h")
+    # Recency boost: full weight for unread, half for read
+    age = now - email.date
+    recency_multiplier = 1.0 if not email.is_read else 0.5
+    if age < timedelta(hours=1):
+        score += round(0.20 * recency_multiplier, 2)
+        signals.append("recency:1h")
+    elif age < timedelta(hours=4):
+        score += round(0.15 * recency_multiplier, 2)
+        signals.append("recency:4h")
+    elif age < timedelta(hours=12):
+        score += round(0.10 * recency_multiplier, 2)
+        signals.append("recency:12h")
+    elif age < timedelta(hours=24):
+        score += round(0.05 * recency_multiplier, 2)
+        signals.append("recency:24h")
 
     # Thread activity: emails sharing same thread_id
     if email.thread_id and sender_counts.get(f"thread:{email.thread_id}", 0) >= 3:
-        score += 0.15
+        score += 0.20
         signals.append("active_thread")
 
     # Floor/ceiling rules
@@ -240,7 +256,7 @@ def score_email(
     )
     if is_automated:
         pre_ceiling_score = score
-        score = min(score, 0.15)
+        score = min(score, 0.10)
         signals.append("newsletter_ceiling")
 
         # Transactional exception: restore score if subject/snippet contains
@@ -308,6 +324,7 @@ def rank_emails(
     now: datetime,
     limit: int = 10,
     overrides: ScoringOverrides | None = None,
+    sender_limit: int = 3,
 ) -> list[PriorityEmail]:
     """Score, deduplicate by thread, and rank emails by priority.
 
@@ -357,6 +374,26 @@ def rank_emails(
         deduplicated.append(representative)
 
     deduplicated.sort(key=lambda p: p.score, reverse=True)
+
+    # Sender diversity: cap emails per sender to prevent notification floods
+    if sender_limit > 0:
+        sender_seen: dict[str, int] = {}
+        diverse: list[PriorityEmail] = []
+        deferred: list[PriorityEmail] = []
+        for p in deduplicated:
+            addr = extract_email_address(p.sender)
+            count = sender_seen.get(addr, 0)
+            if count < sender_limit:
+                diverse.append(p)
+                sender_seen[addr] = count + 1
+            else:
+                deferred.append(p)
+        # Backfill: if fewer than limit after capping, add deferred to fill slots
+        remaining = limit - len(diverse)
+        if remaining > 0 and deferred:
+            diverse.extend(deferred[:remaining])
+        deduplicated = diverse
+
     return deduplicated[:limit]
 
 
