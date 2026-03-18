@@ -35,6 +35,18 @@ class Settings(BaseSettings):
     sso_client_secret: str | None = None
     sso_enforce_only: bool = False  # if True, disable Google/Microsoft consumer login
 
+    # Data residency — restrict processing to specific Azure regions.
+    # When set, the /health endpoint reports the configured region and
+    # deployment metadata. The server itself is stateless (no email content
+    # persisted), so residency is enforced at the infrastructure layer
+    # (Azure Container Apps region selection + ACR geo-replication).
+    data_region: str | None = None  # e.g. "eu-west", "us-east", "af-south"
+    data_residency_strict: bool = False  # if True, reject requests missing region header
+
+    # SCIM bearer token for enterprise user provisioning endpoints.
+    # IdPs (Okta, Azure AD) authenticate SCIM requests with this token.
+    scim_bearer_token: str | None = None
+
     model_config = {"env_prefix": "MINT_", "env_file": ".env", "extra": "ignore"}
 
 
