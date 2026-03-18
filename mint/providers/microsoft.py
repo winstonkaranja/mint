@@ -8,6 +8,7 @@ from mint.models import (
     CalendarEvent,
     CreateEventRequest,
     DraftEmailRequest,
+    DraftSummary,
     Email,
     EmailSummary,
     UpdateEventRequest,
@@ -125,6 +126,31 @@ class OutlookProvider:
                 "thread_id": conv_id,
             })
         return messages
+
+    async def list_drafts(self, max_results: int = 20) -> list[DraftSummary]:
+        resp = await self.client.get(
+            f"{GRAPH_BASE}/mailFolders/Drafts/messages",
+            headers=self.headers,
+            params={
+                "$top": max_results,
+                "$orderby": "createdDateTime desc",
+                "$select": "id,subject,toRecipients,bodyPreview,createdDateTime",
+            },
+        )
+        resp.raise_for_status()
+        results: list[DraftSummary] = []
+        for msg in resp.json().get("value", []):
+            results.append(DraftSummary(
+                id=msg["id"],
+                subject=msg.get("subject", ""),
+                to=[
+                    self._format_address(r["emailAddress"])
+                    for r in msg.get("toRecipients", [])
+                ],
+                snippet=msg.get("bodyPreview", ""),
+                date=msg["createdDateTime"],
+            ))
+        return results
 
     @staticmethod
     def _to_summary(data: dict) -> EmailSummary:

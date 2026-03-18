@@ -5,6 +5,15 @@ from datetime import datetime
 from pydantic import BaseModel
 
 
+class ScoringOverrides(BaseModel):
+    boost_senders: list[str] = []
+    demote_senders: list[str] = []
+    boost_domains: list[str] = []
+    demote_domains: list[str] = []
+    boost_keywords: list[str] = []
+    demote_keywords: list[str] = []
+
+
 class EmailSummary(BaseModel):
     id: str
     subject: str
@@ -32,6 +41,14 @@ class DraftEmailRequest(BaseModel):
     body: str
     cc: list[str] = []
     bcc: list[str] = []
+
+
+class DraftSummary(BaseModel):
+    id: str
+    subject: str
+    to: list[str]
+    snippet: str
+    date: datetime
 
 
 class CalendarEvent(BaseModel):
@@ -105,6 +122,7 @@ class PrepBundle(BaseModel):
     unread_emails: list[AttendeeEmail] = []
     recent_subjects: dict[str, str] = {}  # attendee_email -> most recent subject
     shared_links: list[str] = []
+    contact_frequency: dict[str, int] = {}
 
 
 class EnrichedEvent(BaseModel):
@@ -139,4 +157,15 @@ class DaySummary(BaseModel):
     pending_emails: list[PriorityEmail]
     tomorrow_first_events: list[EnrichedEvent]
     action_items: list[str]
+    timezone: str = "UTC"
+
+
+class WeeklyDigest(BaseModel):
+    week_start: str
+    week_end: str
+    total_emails: int
+    total_unread: int
+    top_senders: list[dict]
+    busiest_day: str | None
+    total_meetings: int
     timezone: str = "UTC"

@@ -7,6 +7,7 @@ from mint.models import (
     CalendarEvent,
     CreateEventRequest,
     DraftEmailRequest,
+    DraftSummary,
     Email,
     EmailSummary,
     UpdateEventRequest,
@@ -21,6 +22,7 @@ class EmailProvider(Protocol):
         self, query: str, max_results: int = 20
     ) -> list[EmailSummary]: ...
     async def get_thread_messages(self, email_id: str) -> list[dict]: ...
+    async def list_drafts(self, max_results: int = 20) -> list[DraftSummary]: ...
 
 
 class CalendarProvider(Protocol):
