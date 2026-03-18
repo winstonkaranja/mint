@@ -14,6 +14,7 @@ from mint.models import (
     EnrichedEvent,
     PrepBundle,
     PriorityEmail,
+    ScoringOverrides,
 )
 
 _EMAIL_RE = re.compile(r"<([^>]+)>")
@@ -35,6 +36,33 @@ _TRANSACTIONAL_KEYWORDS = {
 _PAYMENT_KEYWORDS = {"payment", "invoice", "billing", "receipt", "charge"}
 _DEADLINE_KEYWORDS = {"deadline", "due", "expires", "by end of day", "by eod", "by cob"}
 _DIRECT_QUESTION_PATTERNS = {"can you", "could you", "please review", "your thoughts", "?"}
+_NEGATIVE_SENTIMENT = {
+    "disappointed", "frustrated", "unacceptable", "urgent", "escalat",
+    "complain", "furious", "angry", "critical issue", "broken", "failure",
+    "outage",
+}
+_POSITIVE_SENTIMENT = {
+    "thank you", "great news", "congratulations", "well done", "approved",
+    "good news", "pleased to",
+}
+
+# DLP (Data Loss Prevention) patterns for outbound draft scanning
+_DLP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "Possible SSN detected"),
+    (re.compile(r"\b(?:\d{4}[-\s]?){3}\d{4}\b"), "Possible credit card number detected"),
+    (re.compile(r"\b(?:sk|pk|api|key|token)[-_][a-zA-Z0-9]{20,}\b"), "Possible API key detected"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "Possible AWS access key detected"),
+    (re.compile(r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----"), "Possible private key detected"),
+]
+
+
+def scan_for_sensitive_content(text: str) -> list[str]:
+    """Scan text for sensitive data patterns (SSNs, credit cards, API keys, etc.).
+
+    Returns a list of human-readable finding descriptions for each pattern
+    matched. Returns an empty list if no sensitive content is detected.
+    """
+    return [description for pattern, description in _DLP_PATTERNS if pattern.search(text)]
 
 
 def extract_email_address(sender: str) -> str:
@@ -69,11 +97,42 @@ def build_attendee_map(
     return result
 
 
+def detect_vip_senders(
+    sender_counts: Counter[str],
+    attendee_addrs: set[str],
+) -> frozenset[str]:
+    """Identify VIP senders using frequency and calendar presence.
+
+    A sender qualifies as VIP through either path:
+    - frequency >= 5 AND appears as a calendar event attendee
+    - frequency >= 7 regardless
+    """
+    vip: set[str] = set()
+    for addr, freq in sender_counts.items():
+        if addr.startswith("thread:"):
+            continue
+        if freq >= 7:
+            vip.add(addr)
+        elif freq >= 5 and addr in attendee_addrs:
+            vip.add(addr)
+    return frozenset(vip)
+
+
+def build_relationship_map(emails: list[EmailSummary]) -> dict[str, int]:
+    """Count total emails per sender address to quantify communication density."""
+    freq: Counter[str] = Counter()
+    for e in emails:
+        freq[extract_email_address(e.sender)] += 1
+    return dict(freq)
+
+
 def score_email(
     email: EmailSummary,
     attendee_map: dict[str, list[tuple[str, str]]],
     now: datetime,
     sender_counts: Counter[str],
+    vip_senders: frozenset[str] = frozenset(),
+    overrides: ScoringOverrides | None = None,
 ) -> PriorityEmail:
     """Score a single email with heuristic signals. Returns PriorityEmail."""
     score = 0.0
@@ -117,6 +176,15 @@ def score_email(
         signals.append("body:direct_question")
     score += min(body_score, 0.20)
 
+    # Sentiment signals
+    has_negative = any(kw in text for kw in _NEGATIVE_SENTIMENT)
+    has_positive = any(kw in text for kw in _POSITIVE_SENTIMENT)
+    if has_negative:
+        score += 0.08
+        signals.append("negative_sentiment")
+    elif has_positive:
+        signals.append("positive_sentiment")
+
     # Unread base boost
     if not email.is_read:
         score += 0.10
@@ -126,6 +194,11 @@ def score_email(
     if sender_counts[sender_addr] >= 3:
         score += 0.10
         signals.append(f"sender_frequency:{sender_counts[sender_addr]}")
+
+    # VIP sender boost
+    if sender_addr in vip_senders:
+        score += 0.10
+        signals.append("vip_sender")
 
     # Recency boost (unread only, replaces old unread_4_24h block)
     if not email.is_read:
@@ -177,8 +250,33 @@ def score_email(
             score = pre_ceiling_score
             signals.append("transactional_exception")
 
+    # Custom scoring overrides
+    if overrides is not None:
+        sender_domain = sender_addr.split("@", 1)[1] if "@" in sender_addr else ""
+        if sender_addr in {s.lower() for s in overrides.boost_senders}:
+            score += 0.15
+            signals.append("custom_boost:sender")
+        if sender_addr in {s.lower() for s in overrides.demote_senders}:
+            score -= 0.15
+            signals.append("custom_demote:sender")
+        if sender_domain and sender_domain in {d.lower() for d in overrides.boost_domains}:
+            score += 0.10
+            signals.append("custom_boost:domain")
+        if sender_domain and sender_domain in {d.lower() for d in overrides.demote_domains}:
+            score -= 0.10
+            signals.append("custom_demote:domain")
+        override_text = f"{email.subject} {email.snippet}".lower()
+        for kw in overrides.boost_keywords:
+            if kw.lower() in override_text:
+                score += 0.10
+                signals.append(f"custom_boost:keyword:{kw}")
+        for kw in overrides.demote_keywords:
+            if kw.lower() in override_text:
+                score -= 0.10
+                signals.append(f"custom_demote:keyword:{kw}")
+
     # Final score and tier assignment
-    score = round(min(score, 1.0), 2)
+    score = round(max(0.0, min(score, 1.0)), 2)
 
     if score > 0.8:
         tier = "critical"
@@ -209,6 +307,7 @@ def rank_emails(
     events: list[CalendarEvent],
     now: datetime,
     limit: int = 10,
+    overrides: ScoringOverrides | None = None,
 ) -> list[PriorityEmail]:
     """Score, deduplicate by thread, and rank emails by priority.
 
@@ -226,8 +325,17 @@ def rank_emails(
         if e.thread_id:
             sender_counts[f"thread:{e.thread_id}"] += 1
 
+    # Collect all attendee addresses for VIP detection
+    all_attendee_addrs: set[str] = set()
+    for event in events:
+        for attendee in event.attendees:
+            addr = attendee.lower().strip()
+            if addr:
+                all_attendee_addrs.add(addr)
+    vip_senders = detect_vip_senders(sender_counts, all_attendee_addrs)
+
     scored = [
-        (e.thread_id, score_email(e, attendee_map, now, sender_counts))
+        (e.thread_id, score_email(e, attendee_map, now, sender_counts, vip_senders, overrides))
         for e in emails
     ]
 
@@ -290,6 +398,7 @@ def enrich_events(
     events: list[CalendarEvent],
     emails: list[EmailSummary],
     tz: ZoneInfo | None = None,
+    relationship_map: dict[str, int] | None = None,
 ) -> list[EnrichedEvent]:
     """Attach unread-email counts and prep bundles to each event.
 
@@ -297,6 +406,7 @@ def enrich_events(
     - Unread emails from attendees (as brief AttendeeEmail summaries)
     - Most recent email subject per attendee
     - Shared document links extracted from the event description
+    - Contact frequency per attendee (when relationship_map is provided)
 
     If *tz* is provided, populates start_local / end_local with
     human-readable times in that timezone (e.g. "9:00 AM EAT").
@@ -344,10 +454,18 @@ def enrich_events(
             _extract_doc_links(event.description) if event.description else []
         )
 
+        contact_frequency: dict[str, int] = {}
+        if relationship_map is not None:
+            for addr in attendee_addrs:
+                count = relationship_map.get(addr, 0)
+                if count > 0:
+                    contact_frequency[addr] = count
+
         prep_bundle = PrepBundle(
             unread_emails=unread_emails,
             recent_subjects=recent_subjects,
             shared_links=shared_links,
+            contact_frequency=contact_frequency,
         )
 
         start_local: str | None = None
