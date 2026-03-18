@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html as _html
+from typing import Any
 
 
 def provider_picker_html(
@@ -223,5 +224,243 @@ def landing_page_html(mcp_url: str) -> str:
 </section>
 
 <footer>Mint &mdash; open-source MCP server for email &amp; calendar</footer>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# /docs — Interactive API documentation
+# ---------------------------------------------------------------------------
+
+def _schema_type_label(prop: dict[str, Any]) -> str:
+    """Derive a human-readable type label from a JSON Schema property."""
+    if "anyOf" in prop:
+        parts = [_schema_type_label(branch) for branch in prop["anyOf"]]
+        non_null = [p for p in parts if p != "null"]
+        if len(non_null) == 1 and len(parts) > 1:
+            return f"{non_null[0]} | null"
+        return " | ".join(parts)
+
+    if "allOf" in prop and len(prop["allOf"]) == 1:
+        return _schema_type_label(prop["allOf"][0])
+
+    if "$ref" in prop:
+        ref = prop["$ref"]
+        # e.g. "#/$defs/ScoringOverrides" -> "ScoringOverrides"
+        return ref.rsplit("/", 1)[-1]
+
+    schema_type = prop.get("type", "any")
+
+    if schema_type == "array":
+        items = prop.get("items", {})
+        item_label = _schema_type_label(items) if items else "any"
+        return f"list[{item_label}]"
+
+    type_map = {"string": "str", "integer": "int", "number": "float", "boolean": "bool"}
+    return type_map.get(schema_type, schema_type)
+
+
+def _render_param_row(name: str, prop: dict[str, Any], is_required: bool) -> str:
+    """Render a single parameter as an HTML table row."""
+    name_escaped = _html.escape(name)
+    type_label = _html.escape(_schema_type_label(prop))
+    description = _html.escape(prop.get("description", ""))
+
+    if is_required:
+        required_badge = '<span class="badge badge-required">required</span>'
+        default_cell = "&mdash;"
+    else:
+        required_badge = '<span class="badge badge-optional">optional</span>'
+        default = prop.get("default")
+        if default is None:
+            default_cell = '<code class="default">None</code>'
+        elif isinstance(default, str):
+            default_cell = f'<code class="default">&quot;{_html.escape(default)}&quot;</code>'
+        elif isinstance(default, list):
+            default_cell = '<code class="default">[]</code>'
+        else:
+            default_cell = f'<code class="default">{_html.escape(str(default))}</code>'
+
+    return f"""\
+      <tr>
+        <td><code>{name_escaped}</code></td>
+        <td><code>{type_label}</code></td>
+        <td>{default_cell}</td>
+        <td>{required_badge}</td>
+        <td class="param-desc">{description}</td>
+      </tr>"""
+
+
+def _render_tool_card(tool: dict[str, Any]) -> str:
+    """Render a single tool as a collapsible card."""
+    name = _html.escape(tool["name"])
+    description = _html.escape(tool.get("description") or "")
+    is_read_only = tool.get("read_only", False)
+
+    badge = (
+        '<span class="badge badge-read">read-only</span>'
+        if is_read_only
+        else '<span class="badge badge-mutate">mutating</span>'
+    )
+
+    params = tool.get("parameters", [])
+
+    if params:
+        rows = "\n".join(
+            _render_param_row(p["name"], p["schema"], p["required"])
+            for p in params
+        )
+        params_html = f"""\
+    <table>
+      <thead>
+        <tr>
+          <th>Parameter</th><th>Type</th><th>Default</th><th>Status</th><th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+{rows}
+      </tbody>
+    </table>"""
+    else:
+        params_html = '    <p class="no-params">No parameters.</p>'
+
+    return f"""\
+  <details class="tool-card" open>
+    <summary>
+      <strong>{name}</strong>
+      {badge}
+    </summary>
+    <p class="tool-desc">{description}</p>
+{params_html}
+  </details>"""
+
+
+def tools_docs_html(tools: list[dict[str, Any]]) -> str:
+    """Interactive API documentation page served at /docs."""
+    tool_cards = "\n\n".join(_render_tool_card(t) for t in tools)
+    tool_count = len(tools)
+    read_count = sum(1 for t in tools if t.get("read_only"))
+    mutate_count = tool_count - read_count
+
+    return f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API Documentation &mdash; Mint</title>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; font-family: system-ui, -apple-system, sans-serif;
+    background: #f8faf8; color: #1a1a1a; line-height: 1.6;
+  }}
+
+  /* --- header --- */
+  .hero {{
+    max-width: 760px; margin: 0 auto; padding: 3rem 1.5rem 1.5rem;
+    text-align: center;
+  }}
+  .logo {{ font-size: 2.5rem; }}
+  h1 {{ font-size: 1.75rem; margin: .25rem 0 .15rem; font-weight: 700; }}
+  .tagline {{ color: #555; font-size: .95rem; margin-bottom: .5rem; }}
+  .stats {{
+    display: flex; justify-content: center; gap: 1.5rem;
+    font-size: .85rem; color: #777; margin-bottom: 1.5rem;
+  }}
+
+  /* --- tool cards --- */
+  .tools {{ max-width: 760px; margin: 0 auto; padding: 0 1.5rem 3rem; }}
+
+  .tool-card {{
+    background: #fff; border: 1px solid #e8e8e8; border-radius: 10px;
+    margin-bottom: 1rem; overflow: hidden;
+    box-shadow: 0 1px 4px rgba(0,0,0,.04);
+    transition: box-shadow .15s;
+  }}
+  .tool-card[open] {{ box-shadow: 0 2px 8px rgba(0,0,0,.07); }}
+
+  .tool-card summary {{
+    padding: .9rem 1.25rem; cursor: pointer;
+    display: flex; align-items: center; gap: .6rem;
+    list-style: none; user-select: none;
+  }}
+  .tool-card summary::-webkit-details-marker {{ display: none; }}
+  .tool-card summary::before {{
+    content: "\\25B6"; font-size: .65rem; color: #999;
+    transition: transform .15s;
+  }}
+  .tool-card[open] summary::before {{ transform: rotate(90deg); }}
+
+  .tool-card summary strong {{
+    font-size: 1rem; font-family: 'SF Mono', 'Fira Code', monospace;
+  }}
+
+  .tool-desc {{
+    padding: 0 1.25rem .5rem; margin: 0;
+    color: #555; font-size: .9rem;
+  }}
+
+  .no-params {{
+    padding: 0 1.25rem 1rem; margin: 0;
+    color: #999; font-size: .85rem; font-style: italic;
+  }}
+
+  /* --- badges --- */
+  .badge {{
+    display: inline-block; font-size: .7rem; font-weight: 600;
+    padding: .15rem .5rem; border-radius: 4px; text-transform: uppercase;
+    letter-spacing: .03em;
+  }}
+  .badge-read {{ background: #e8f5e9; color: #2e7d32; }}
+  .badge-mutate {{ background: #fff3e0; color: #e65100; }}
+  .badge-required {{ background: #fce4ec; color: #c62828; }}
+  .badge-optional {{ background: #e3f2fd; color: #1565c0; }}
+
+  /* --- parameter table --- */
+  table {{
+    width: 100%; border-collapse: collapse;
+    font-size: .85rem; margin: 0 0 .75rem;
+  }}
+  thead {{ background: #fafafa; }}
+  th {{
+    text-align: left; padding: .5rem 1rem; font-weight: 600;
+    color: #555; font-size: .75rem; text-transform: uppercase;
+    letter-spacing: .04em; border-bottom: 1px solid #eee;
+  }}
+  td {{
+    padding: .45rem 1rem; border-bottom: 1px solid #f0f0f0;
+    vertical-align: top;
+  }}
+  td code {{ font-size: .82rem; color: #333; }}
+  code.default {{ color: #888; }}
+  .param-desc {{ color: #666; font-size: .82rem; }}
+
+  /* --- footer --- */
+  footer {{
+    text-align: center; padding: 2rem 1rem; color: #999; font-size: .8rem;
+  }}
+  footer a {{ color: #777; }}
+</style>
+</head>
+<body>
+<div class="hero">
+  <div class="logo">&#127807;</div>
+  <h1>Mint API Documentation</h1>
+  <p class="tagline">MCP tools for email &amp; calendar intelligence</p>
+  <div class="stats">
+    <span>{tool_count} tools</span>
+    <span>{read_count} read-only</span>
+    <span>{mutate_count} mutating</span>
+  </div>
+</div>
+
+<div class="tools">
+{tool_cards}
+</div>
+
+<footer>
+  <a href="/">&#8592; Back to Mint</a>
+</footer>
 </body>
 </html>"""
