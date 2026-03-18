@@ -89,6 +89,22 @@ class PriorityEmail(BaseModel):
     related_event: str | None = None
     tier: str = "low"
     message_count: int = 1
+    thread_id: str | None = None
+    awaiting_reply: bool = False
+    awaiting_reply_hours: int | None = None
+
+
+class AttendeeEmail(BaseModel):
+    sender: str
+    subject: str
+    date: datetime
+    is_read: bool
+
+
+class PrepBundle(BaseModel):
+    unread_emails: list[AttendeeEmail] = []
+    recent_subjects: dict[str, str] = {}  # attendee_email -> most recent subject
+    shared_links: list[str] = []
 
 
 class EnrichedEvent(BaseModel):
@@ -103,6 +119,7 @@ class EnrichedEvent(BaseModel):
     unread_from_attendees: int = 0
     start_local: str | None = None
     end_local: str | None = None
+    prep_bundle: PrepBundle | None = None
 
 
 class DailyBrief(BaseModel):

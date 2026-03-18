@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from mint.models import (
+    AttendeeEmail,
     CalendarEvent,
     EmailSummary,
     EnrichedEvent,
+    PrepBundle,
     PriorityEmail,
 )
 
@@ -198,6 +200,7 @@ def score_email(
         signals=signals,
         related_event=related_event,
         tier=tier,
+        thread_id=email.thread_id,
     )
 
 
@@ -262,26 +265,90 @@ def _format_local_time(dt: datetime, tz: ZoneInfo) -> str:
     return f"{time_str} {local_dt.strftime('%Z')}"
 
 
+_DOC_LINK_RE = re.compile(
+    r"https?://(?:"
+    r"docs\.google\.com|"
+    r"sheets\.google\.com|"
+    r"slides\.google\.com|"
+    r"drive\.google\.com|"
+    r"(?:www\.)?notion\.so|"
+    r"sharepoint\.com"
+    r")/[^\s<>\"')]*",
+)
+
+
+def _extract_doc_links(text: str) -> list[str]:
+    """Extract document/collaboration URLs from event description text.
+
+    Matches Google Docs/Sheets/Slides/Drive, Notion, and SharePoint links.
+    Deliberately excludes meeting links (Zoom, Teams, etc.).
+    """
+    return list(dict.fromkeys(_DOC_LINK_RE.findall(text)))
+
+
 def enrich_events(
     events: list[CalendarEvent],
     emails: list[EmailSummary],
     tz: ZoneInfo | None = None,
 ) -> list[EnrichedEvent]:
-    """Attach unread-email counts from attendees to each event.
+    """Attach unread-email counts and prep bundles to each event.
+
+    Each prep bundle contains:
+    - Unread emails from attendees (as brief AttendeeEmail summaries)
+    - Most recent email subject per attendee
+    - Shared document links extracted from the event description
 
     If *tz* is provided, populates start_local / end_local with
     human-readable times in that timezone (e.g. "9:00 AM EAT").
     """
-    # Build set of senders with unread emails
+    # Index all emails by sender address for efficient per-attendee lookup
     unread_senders: set[str] = set()
+    emails_by_sender: dict[str, list[EmailSummary]] = defaultdict(list)
     for e in emails:
+        addr = extract_email_address(e.sender)
+        emails_by_sender[addr].append(e)
         if not e.is_read:
-            unread_senders.add(extract_email_address(e.sender))
+            unread_senders.add(addr)
 
     result = []
     for event in events:
         attendee_addrs = {a.lower().strip() for a in event.attendees}
         unread_count = len(attendee_addrs & unread_senders)
+
+        # Build prep bundle
+        unread_emails: list[AttendeeEmail] = []
+        recent_subjects: dict[str, str] = {}
+
+        for addr in attendee_addrs:
+            sender_emails = emails_by_sender.get(addr, [])
+            if not sender_emails:
+                continue
+
+            # Unread emails from this attendee
+            for em in sender_emails:
+                if not em.is_read:
+                    unread_emails.append(
+                        AttendeeEmail(
+                            sender=em.sender,
+                            subject=em.subject,
+                            date=em.date,
+                            is_read=em.is_read,
+                        )
+                    )
+
+            # Most recent email subject from this attendee
+            most_recent = max(sender_emails, key=lambda em: em.date)
+            recent_subjects[addr] = most_recent.subject
+
+        shared_links = (
+            _extract_doc_links(event.description) if event.description else []
+        )
+
+        prep_bundle = PrepBundle(
+            unread_emails=unread_emails,
+            recent_subjects=recent_subjects,
+            shared_links=shared_links,
+        )
 
         start_local: str | None = None
         end_local: str | None = None
@@ -302,6 +369,7 @@ def enrich_events(
                 unread_from_attendees=unread_count,
                 start_local=start_local,
                 end_local=end_local,
+                prep_bundle=prep_bundle,
             )
         )
     return result
@@ -344,16 +412,82 @@ def generate_highlights(
     return highlights
 
 
+def detect_awaiting_replies(
+    scored_emails: list[PriorityEmail],
+    now: datetime,
+    threshold_hours: int = 48,
+) -> list[PriorityEmail]:
+    """Flag threads where the user likely sent the last message and received no reply.
+
+    Uses a signal-based heuristic that avoids extra API calls: a thread is
+    considered "awaiting reply" when its most recent email is read (the user
+    saw and presumably replied) and no newer unread message arrived within
+    *threshold_hours*.
+
+    Groups emails by thread_id, inspects each thread's timeline, and mutates
+    the representative PriorityEmail objects in-place (setting
+    ``awaiting_reply`` and ``awaiting_reply_hours``).  Emails without a
+    thread_id are skipped.
+
+    Returns the subset of emails that were flagged.
+    """
+    # Group by thread — None-keyed emails are standalone, skip them
+    threads: dict[str, list[PriorityEmail]] = {}
+    for email in scored_emails:
+        if email.thread_id:
+            threads.setdefault(email.thread_id, []).append(email)
+
+    flagged: list[PriorityEmail] = []
+
+    for thread_emails in threads.values():
+        # Sort by date descending so [0] is the newest message in the thread
+        thread_emails.sort(key=lambda e: e.date, reverse=True)
+        newest = thread_emails[0]
+
+        # The heuristic: if the newest message is read and old enough, the
+        # user likely responded and is waiting for the other party.  If any
+        # unread message exists in the thread, the other party already replied.
+        has_unread = any(not e.is_read for e in thread_emails)
+        if has_unread:
+            continue
+
+        hours_since = int((now - newest.date).total_seconds() / 3600)
+        if newest.is_read and hours_since >= threshold_hours:
+            newest.awaiting_reply = True
+            newest.awaiting_reply_hours = hours_since
+            flagged.append(newest)
+
+    return flagged
+
+
 def generate_action_items(
-    emails: list[PriorityEmail], events: list[EnrichedEvent]
+    emails: list[PriorityEmail],
+    events: list[EnrichedEvent],
+    all_scored_emails: list[PriorityEmail] | None = None,
+    now: datetime | None = None,
 ) -> list[str]:
-    """Generate end-of-day action items from pending emails and tomorrow's events."""
+    """Generate end-of-day action items from pending emails and tomorrow's events.
+
+    When *all_scored_emails* and *now* are provided, also detects threads
+    awaiting a reply (read threads with no new messages in 48+ hours) and
+    suggests follow-ups.
+    """
     items: list[str] = []
 
     # Unread high-priority emails
     pending = [e for e in emails if not e.is_read and e.score >= 0.50]
     for e in pending:
         items.append(f"Respond to \"{e.subject}\" from {e.sender}")
+
+    # Awaiting reply detection
+    if all_scored_emails is not None and now is not None:
+        detect_awaiting_replies(all_scored_emails, now)
+        awaiting = [e for e in all_scored_emails if e.awaiting_reply]
+        for e in awaiting:
+            items.append(
+                f"No reply in {e.awaiting_reply_hours}h on \"{e.subject}\" "
+                f"\N{EM DASH} consider following up"
+            )
 
     # Tomorrow's first events that need prep
     for event in events:
