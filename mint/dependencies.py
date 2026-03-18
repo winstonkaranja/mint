@@ -34,9 +34,8 @@ import httpx
 from fastmcp.dependencies import CurrentAccessToken, Depends
 from fastmcp.server.dependencies import AccessToken
 
+from mint.providers import get_calendar_provider_class, get_email_provider_class
 from mint.providers.base import CalendarProvider, EmailProvider
-from mint.providers.google import GmailProvider, GoogleCalendarProvider
-from mint.providers.microsoft import MicrosoftCalendarProvider, OutlookProvider
 
 
 def _provider_from_token(access_token: AccessToken) -> str:
@@ -67,9 +66,9 @@ async def get_email_provider(
     from the validated AccessToken, ensuring complete user isolation.
     """
     token = access_token.token
-    if _provider_from_token(access_token) == "microsoft":
-        return OutlookProvider(client=client, token=token)
-    return GmailProvider(client=client, token=token)
+    provider_name = _provider_from_token(access_token)
+    cls = get_email_provider_class(provider_name)
+    return cls(client=client, token=token)
 
 
 async def get_calendar_provider(
@@ -83,9 +82,9 @@ async def get_calendar_provider(
     user isolation.
     """
     token = access_token.token
-    if _provider_from_token(access_token) == "microsoft":
-        return MicrosoftCalendarProvider(client=client, token=token)
-    return GoogleCalendarProvider(client=client, token=token)
+    provider_name = _provider_from_token(access_token)
+    cls = get_calendar_provider_class(provider_name)
+    return cls(client=client, token=token)
 
 
 # ---------------------------------------------------------------------------
