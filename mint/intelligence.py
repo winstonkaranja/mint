@@ -49,6 +49,15 @@ _REPLY_REQUESTED_PATTERNS = frozenset({
     "please reply", "your response", "rsvp", "please respond",
     "awaiting your", "waiting for your", "get back to",
 })
+_SECURITY_ALERT_KEYWORDS = frozenset({
+    "security alert", "breach", "leaked", "unauthorized", "suspicious",
+    "compromised", "vulnerability", "incident", "exposed", "secret",
+    "malware", "phishing", "intrusion",
+})
+_BILLING_ALERT_KEYWORDS = frozenset({
+    "payment failed", "billing alert", "overdue", "past due",
+    "charge", "invoice due", "payment due", "account suspended",
+})
 
 # DLP (Data Loss Prevention) patterns for outbound draft scanning
 _DLP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -165,7 +174,7 @@ def score_email(
         if kw in text:
             keyword_score += 0.12
             signals.append(f"keyword:{kw}")
-    score += min(keyword_score, 0.25)
+    score += min(keyword_score, 0.35)
 
     # Body-text scoring on snippet
     body_score = 0.0
@@ -265,6 +274,15 @@ def score_email(
         if any(kw in combined_text for kw in _TRANSACTIONAL_KEYWORDS):
             score = pre_ceiling_score
             signals.append("transactional_exception")
+
+        # Priority alert floors — security/billing alerts from automated
+        # senders deserve higher scores than promotional emails
+        if any(kw in combined_text for kw in _SECURITY_ALERT_KEYWORDS):
+            score = max(score, 0.55)
+            signals.append("security_alert_floor")
+        elif any(kw in combined_text for kw in _BILLING_ALERT_KEYWORDS):
+            score = max(score, 0.45)
+            signals.append("billing_alert_floor")
 
     # Custom scoring overrides
     if overrides is not None:
