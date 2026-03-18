@@ -1,9 +1,10 @@
-"""Intelligence-gated tools: 7 focused tools backed by server-side scoring and cross-referencing."""
+"""Intelligence-gated tools: 10 focused tools backed by server-side scoring and cross-referencing."""
 
 from __future__ import annotations
 
 import asyncio
 import time
+from collections import Counter
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -21,11 +22,13 @@ from mint.errors import (
     rate_limited,
 )
 from mint.intelligence import (
+    build_relationship_map,
     detect_awaiting_replies,
     enrich_events,
     generate_action_items,
     generate_highlights,
     rank_emails,
+    scan_for_sensitive_content,
 )
 from mint.models import (
     CalendarEvent,
@@ -33,10 +36,13 @@ from mint.models import (
     DailyBrief,
     DaySummary,
     DraftEmailRequest,
+    DraftSummary,
     EmailThread,
     EnrichedEvent,
     PriorityEmail,
+    ScoringOverrides,
     ThreadMessage,
+    WeeklyDigest,
 )
 from mint.providers.base import CalendarProvider, EmailProvider
 
@@ -64,6 +70,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     @mcp.tool(annotations={"readOnlyHint": True})
     async def get_daily_brief(
         timezone: str = "UTC",
+        scoring_overrides: ScoringOverrides | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
@@ -87,9 +94,10 @@ def register_smart_tools(mcp: FastMCP) -> None:
             except Exception as exc:
                 raise provider_error(str(exc)) from exc
 
-            priority = rank_emails(emails, events, now_utc, limit=10)
+            priority = rank_emails(emails, events, now_utc, limit=10, overrides=scoring_overrides)
+            relationship_map = build_relationship_map(emails)
             today_events = [e for e in events if e.start.date() == now.date()]
-            enriched = enrich_events(today_events, emails, tz=tz)
+            enriched = enrich_events(today_events, emails, tz=tz, relationship_map=relationship_map)
             highlights = generate_highlights(enriched, priority, tz=tz)
 
             # Detect threads awaiting a reply and surface them in highlights
@@ -120,6 +128,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     @mcp.tool(annotations={"readOnlyHint": True})
     async def get_priority_emails(
         limit: int = 10,
+        scoring_overrides: ScoringOverrides | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
@@ -141,7 +150,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
             except Exception as exc:
                 raise provider_error(str(exc)) from exc
 
-            result = rank_emails(emails, events, now, limit=limit)
+            result = rank_emails(emails, events, now, limit=limit, overrides=scoring_overrides)
             log_tool_call("get_priority_emails", user_email, _params, "success", (time.monotonic() - _start) * 1000)
             return result
         except MintToolError as exc:
@@ -216,6 +225,22 @@ def register_smart_tools(mcp: FastMCP) -> None:
             if not subject.lower().startswith("re:"):
                 subject = f"Re: {subject}"
 
+            # DLP: block drafts containing sensitive data patterns
+            findings = scan_for_sensitive_content(body)
+            if findings:
+                raise invalid_input(
+                    f"Draft blocked: sensitive content detected \N{EM DASH} {', '.join(findings)}",
+                    "Remove or redact sensitive data before drafting",
+                )
+
+            # DLP scan before drafting
+            findings = scan_for_sensitive_content(body)
+            if findings:
+                raise invalid_input(
+                    f"Draft blocked: sensitive content detected — {', '.join(findings)}",
+                    "Remove or redact sensitive data before drafting",
+                )
+
             request = DraftEmailRequest(
                 to=[original.sender],
                 subject=subject,
@@ -263,7 +288,8 @@ def register_smart_tools(mcp: FastMCP) -> None:
             except Exception as exc:
                 raise provider_error(str(exc)) from exc
 
-            result = enrich_events(events, emails, tz=tz)
+            relationship_map = build_relationship_map(emails)
+            result = enrich_events(events, emails, tz=tz, relationship_map=relationship_map)
             log_tool_call("get_upcoming_events", user_email, _params, "success", (time.monotonic() - _start) * 1000)
             return result
         except MintToolError as exc:
@@ -312,6 +338,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     @mcp.tool(annotations={"readOnlyHint": True})
     async def summarize_day(
         timezone: str = "UTC",
+        scoring_overrides: ScoringOverrides | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
@@ -341,9 +368,10 @@ def register_smart_tools(mcp: FastMCP) -> None:
 
             # Include tomorrow's events for scoring
             all_events = today_events + tomorrow_events
-            priority = rank_emails(emails, all_events, now_utc, limit=10)
-            enriched_today = enrich_events(today_events, emails, tz=tz)
-            enriched_tomorrow = enrich_events(tomorrow_events, emails, tz=tz)
+            priority = rank_emails(emails, all_events, now_utc, limit=10, overrides=scoring_overrides)
+            relationship_map = build_relationship_map(emails)
+            enriched_today = enrich_events(today_events, emails, tz=tz, relationship_map=relationship_map)
+            enriched_tomorrow = enrich_events(tomorrow_events, emails, tz=tz, relationship_map=relationship_map)
 
             pending = [e for e in priority if not e.is_read and e.score >= 0.40]
             action_items = generate_action_items(
@@ -367,4 +395,83 @@ def register_smart_tools(mcp: FastMCP) -> None:
             return result
         except MintToolError as exc:
             log_tool_call("summarize_day", user_email, _params, "error", (time.monotonic() - _start) * 1000, error_code=exc.error.error_code)
+            raise
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    async def get_weekly_digest(
+        timezone: str = "UTC",
+        user_email: str | None = Depends(get_user_email),
+        email_provider: EmailProvider = Depends(get_email_provider),
+        calendar_provider: CalendarProvider = Depends(get_calendar_provider),
+    ) -> WeeklyDigest:
+        """Weekly activity digest: total emails and unread count, top 5 senders, busiest day by email volume, and total meetings over the past 7 days. One call for a quick retrospective."""
+        _start = time.monotonic()
+        _params = {"timezone": timezone}
+        try:
+            tz = _resolve_timezone(timezone)
+            now = datetime.now(tz)
+            week_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            week_start = week_end - timedelta(days=7)
+
+            try:
+                emails_task = email_provider.get_inbox(max_results=200)
+                events_task = calendar_provider.list_events(week_start, week_end, max_results=200)
+                emails, events = await asyncio.gather(emails_task, events_task)
+            except httpx.HTTPStatusError as exc:
+                _raise_for_http_error(exc)
+            except Exception as exc:
+                raise provider_error(str(exc)) from exc
+
+            week_emails = [e for e in emails if e.date.date() >= week_start.date()]
+
+            sender_counts = Counter(e.sender for e in week_emails)
+            top_senders = [
+                {"sender": sender, "count": count}
+                for sender, count in sender_counts.most_common(5)
+            ]
+
+            day_counts: dict[str, int] = {}
+            for e in week_emails:
+                day_key = e.date.strftime("%Y-%m-%d")
+                day_counts[day_key] = day_counts.get(day_key, 0) + 1
+
+            busiest_day = max(day_counts, key=day_counts.get) if day_counts else None
+
+            result = WeeklyDigest(
+                week_start=week_start.strftime("%Y-%m-%d"),
+                week_end=(week_end - timedelta(days=1)).strftime("%Y-%m-%d"),
+                total_emails=len(week_emails),
+                total_unread=sum(1 for e in week_emails if not e.is_read),
+                top_senders=top_senders,
+                busiest_day=busiest_day,
+                total_meetings=len(events),
+                timezone=timezone,
+            )
+            log_tool_call("get_weekly_digest", user_email, _params, "success", (time.monotonic() - _start) * 1000)
+            return result
+        except MintToolError as exc:
+            log_tool_call("get_weekly_digest", user_email, _params, "error", (time.monotonic() - _start) * 1000, error_code=exc.error.error_code)
+            raise
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    async def get_pending_drafts(
+        max_results: int = 20,
+        user_email: str | None = Depends(get_user_email),
+        email_provider: EmailProvider = Depends(get_email_provider),
+    ) -> list[DraftSummary]:
+        """List all email drafts so you can review AI-drafted replies before sending. Returns draft ID, subject, recipients, and a snippet for each pending draft."""
+        _start = time.monotonic()
+        _params = {"max_results": max_results}
+        try:
+            try:
+                result = await email_provider.list_drafts(max_results)
+            except httpx.HTTPStatusError as exc:
+                _raise_for_http_error(exc)
+            except Exception as exc:
+                raise provider_error(str(exc)) from exc
+
+            log_tool_call("get_pending_drafts", user_email, _params, "success", (time.monotonic() - _start) * 1000)
+            return result
+        except MintToolError as exc:
+            log_tool_call("get_pending_drafts", user_email, _params, "error", (time.monotonic() - _start) * 1000, error_code=exc.error.error_code)
             raise
