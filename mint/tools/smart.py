@@ -73,13 +73,14 @@ def register_smart_tools(mcp: FastMCP) -> None:
     async def get_daily_brief(
         timezone: str = "UTC",
         scoring_overrides: ScoringOverrides | None = None,
+        mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> DailyBrief:
         """Morning snapshot: today's meetings enriched with related unread emails, top priority emails scored by urgency, and cross-referenced highlights. One call replaces reading inbox + checking calendar.
 
-        Example: get_daily_brief(timezone="Africa/Nairobi") — returns brief with times as "9:00 AM EAT". Pass scoring_overrides to boost/demote specific senders or domains."""
+        Example: get_daily_brief(timezone="Africa/Nairobi") — returns brief with times as "9:00 AM EAT". Pass scoring_overrides to boost/demote specific senders or domains. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"timezone": timezone}
         try:
@@ -90,8 +91,8 @@ def register_smart_tools(mcp: FastMCP) -> None:
             today_end = today_start + timedelta(days=2)  # include tomorrow for scoring
 
             try:
-                emails_task = email_provider.get_inbox(max_results=50)
-                events_task = calendar_provider.list_events(today_start, today_end, max_results=30)
+                emails_task = email_provider.get_inbox(max_results=50, mailbox=mailbox)
+                events_task = calendar_provider.list_events(today_start, today_end, max_results=30, mailbox=mailbox)
                 emails, events = await asyncio.gather(emails_task, events_task)
             except httpx.HTTPStatusError as exc:
                 _raise_for_http_error(exc)
@@ -133,13 +134,14 @@ def register_smart_tools(mcp: FastMCP) -> None:
     async def get_priority_emails(
         limit: int = 10,
         scoring_overrides: ScoringOverrides | None = None,
+        mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> list[PriorityEmail]:
         """Top emails scored by urgency. Each email gets a 0.0-1.0 priority score based on calendar relevance, urgency keywords, recency, and thread activity. Returns the top results, not the full inbox.
 
-        Example: get_priority_emails(limit=5) — top 5 emails. With overrides: get_priority_emails(scoring_overrides={"boost_senders": ["ceo@company.com"], "demote_domains": ["marketing.com"]})"""
+        Example: get_priority_emails(limit=5) — top 5 emails. With overrides: get_priority_emails(scoring_overrides={"boost_senders": ["ceo@company.com"], "demote_domains": ["marketing.com"]}). Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"limit": limit}
         try:
@@ -148,8 +150,8 @@ def register_smart_tools(mcp: FastMCP) -> None:
             today_end = today_start + timedelta(days=2)
 
             try:
-                emails_task = email_provider.get_inbox(max_results=50)
-                events_task = calendar_provider.list_events(today_start, today_end, max_results=30)
+                emails_task = email_provider.get_inbox(max_results=50, mailbox=mailbox)
+                events_task = calendar_provider.list_events(today_start, today_end, max_results=30, mailbox=mailbox)
                 emails, events = await asyncio.gather(emails_task, events_task)
             except httpx.HTTPStatusError as exc:
                 _raise_for_http_error(exc)
@@ -166,18 +168,19 @@ def register_smart_tools(mcp: FastMCP) -> None:
     @mcp.tool(annotations={"readOnlyHint": True})
     async def get_email_thread(
         email_id: str,
+        mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
     ) -> EmailThread:
         """Get the full conversation thread for an email. Returns all messages in the thread with sender, date, and body.
 
-        Example: get_email_thread(email_id="18f3a4b2c1d0e5f6") — returns all messages in that thread. Use an email ID from get_priority_emails or get_daily_brief results."""
+        Example: get_email_thread(email_id="18f3a4b2c1d0e5f6") — returns all messages in that thread. Use an email ID from get_priority_emails or get_daily_brief results. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"email_id": email_id}
         try:
             try:
-                email = await email_provider.get_email(email_id)
-                raw_messages = await email_provider.get_thread_messages(email_id)
+                email = await email_provider.get_email(email_id, mailbox=mailbox)
+                raw_messages = await email_provider.get_thread_messages(email_id, mailbox=mailbox)
             except httpx.HTTPStatusError as exc:
                 _raise_for_http_error(exc, resource_type="email", resource_id=email_id)
             except Exception as exc:
@@ -215,17 +218,18 @@ def register_smart_tools(mcp: FastMCP) -> None:
         body: str,
         cc: list[str] = [],
         bcc: list[str] = [],
+        mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
     ) -> str:
         """Draft a reply to an email. Reads the original email, creates a reply draft with Re: subject addressed to the sender. Never sends — the user reviews and sends from their mail client. Returns the draft ID. Body is scanned for sensitive content (SSNs, credit cards, API keys) before drafting.
 
-        Example: draft_email_reply(email_id="18f3a4b2c1d0e5f6", body="Thanks, I'll review by Friday.")"""
+        Example: draft_email_reply(email_id="18f3a4b2c1d0e5f6", body="Thanks, I'll review by Friday."). Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"email_id": email_id, "body": body, "cc": cc, "bcc": bcc}
         try:
             try:
-                original = await email_provider.get_email(email_id)
+                original = await email_provider.get_email(email_id, mailbox=mailbox)
             except httpx.HTTPStatusError as exc:
                 _raise_for_http_error(exc, resource_type="email", resource_id=email_id)
             except Exception as exc:
@@ -252,7 +256,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
             )
 
             try:
-                result = await email_provider.draft_email(request)
+                result = await email_provider.draft_email(request, mailbox=mailbox)
             except httpx.HTTPStatusError as exc:
                 _raise_for_http_error(exc)
             except Exception as exc:
@@ -268,13 +272,14 @@ def register_smart_tools(mcp: FastMCP) -> None:
     async def get_upcoming_events(
         days: int = 7,
         timezone: str = "UTC",
+        mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> list[EnrichedEvent]:
         """Calendar events for the next N days, enriched with unread email counts from attendees. Shows which meetings have related unread emails so you can prepare.
 
-        Example: get_upcoming_events(days=3, timezone="US/Eastern") — next 3 days with times in ET."""
+        Example: get_upcoming_events(days=3, timezone="US/Eastern") — next 3 days with times in ET. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"days": days, "timezone": timezone}
         try:
@@ -284,8 +289,8 @@ def register_smart_tools(mcp: FastMCP) -> None:
             end = start + timedelta(days=days)
 
             try:
-                emails_task = email_provider.get_inbox(max_results=50)
-                events_task = calendar_provider.list_events(start, end, max_results=50)
+                emails_task = email_provider.get_inbox(max_results=50, mailbox=mailbox)
+                events_task = calendar_provider.list_events(start, end, max_results=50, mailbox=mailbox)
                 emails, events = await asyncio.gather(emails_task, events_task)
             except httpx.HTTPStatusError as exc:
                 _raise_for_http_error(exc)
@@ -345,13 +350,14 @@ def register_smart_tools(mcp: FastMCP) -> None:
     async def summarize_day(
         timezone: str = "UTC",
         scoring_overrides: ScoringOverrides | None = None,
+        mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> DaySummary:
         """End-of-day summary: emails received, unread count, today's meetings with attendee email activity, pending high-priority emails, tomorrow's first events, and suggested action items.
 
-        Example: summarize_day(timezone="Europe/London") — summary with times in GMT/BST."""
+        Example: summarize_day(timezone="Europe/London") — summary with times in GMT/BST. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"timezone": timezone}
         try:
@@ -363,9 +369,9 @@ def register_smart_tools(mcp: FastMCP) -> None:
             tomorrow_end = today_end + timedelta(days=1)
 
             try:
-                emails_task = email_provider.get_inbox(max_results=50)
-                today_events_task = calendar_provider.list_events(today_start, today_end, max_results=30)
-                tomorrow_events_task = calendar_provider.list_events(today_end, tomorrow_end, max_results=5)
+                emails_task = email_provider.get_inbox(max_results=50, mailbox=mailbox)
+                today_events_task = calendar_provider.list_events(today_start, today_end, max_results=30, mailbox=mailbox)
+                tomorrow_events_task = calendar_provider.list_events(today_end, tomorrow_end, max_results=5, mailbox=mailbox)
                 emails, today_events, tomorrow_events = await asyncio.gather(
                     emails_task, today_events_task, tomorrow_events_task
                 )
@@ -408,13 +414,14 @@ def register_smart_tools(mcp: FastMCP) -> None:
     @mcp.tool(annotations={"readOnlyHint": True})
     async def get_weekly_digest(
         timezone: str = "UTC",
+        mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> WeeklyDigest:
         """Weekly activity digest: total emails and unread count, top 5 senders, busiest day by email volume, and total meetings over the past 7 days. One call for a quick retrospective.
 
-        Example: get_weekly_digest(timezone="Asia/Tokyo") — week summary with JST timestamps."""
+        Example: get_weekly_digest(timezone="Asia/Tokyo") — week summary with JST timestamps. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"timezone": timezone}
         try:
@@ -424,8 +431,8 @@ def register_smart_tools(mcp: FastMCP) -> None:
             week_start = week_end - timedelta(days=7)
 
             try:
-                emails_task = email_provider.get_inbox(max_results=200)
-                events_task = calendar_provider.list_events(week_start, week_end, max_results=200)
+                emails_task = email_provider.get_inbox(max_results=200, mailbox=mailbox)
+                events_task = calendar_provider.list_events(week_start, week_end, max_results=200, mailbox=mailbox)
                 emails, events = await asyncio.gather(emails_task, events_task)
             except httpx.HTTPStatusError as exc:
                 _raise_for_http_error(exc)
@@ -466,17 +473,18 @@ def register_smart_tools(mcp: FastMCP) -> None:
     @mcp.tool(annotations={"readOnlyHint": True})
     async def get_pending_drafts(
         max_results: int = 20,
+        mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
     ) -> list[DraftSummary]:
         """List all email drafts so you can review AI-drafted replies before sending. Returns draft ID, subject, recipients, and a snippet for each pending draft.
 
-        Example: get_pending_drafts(max_results=5) — latest 5 drafts."""
+        Example: get_pending_drafts(max_results=5) — latest 5 drafts. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"max_results": max_results}
         try:
             try:
-                result = await email_provider.list_drafts(max_results)
+                result = await email_provider.list_drafts(max_results, mailbox=mailbox)
             except httpx.HTTPStatusError as exc:
                 _raise_for_http_error(exc)
             except Exception as exc:
