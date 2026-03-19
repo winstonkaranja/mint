@@ -3,11 +3,10 @@ import time
 
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from mint.auth import MintProvider
 from mint.config import get_settings
-from mint.notifications import subscribe, subscriber_count
 from mint.pages import landing_page_html, tools_docs_html
 from mint.scim import (
     scim_create_user,
@@ -94,7 +93,6 @@ async def health_check(request: Request) -> JSONResponse:
         "uptime_seconds": round(time.monotonic() - _start_time),
         "providers": _PROVIDERS,
         "tools_count": _TOOLS_COUNT,
-        "sse_subscribers": subscriber_count(),
         "compliance": {
             "encryption_in_transit": "TLS 1.3 (Azure-managed)",
             "data_at_rest": "none (stateless — no email content persisted)",
@@ -103,20 +101,6 @@ async def health_check(request: Request) -> JSONResponse:
         },
     }
     return JSONResponse(health)
-
-
-@mcp.custom_route("/notifications", methods=["GET"])
-async def sse_notifications(request: Request) -> StreamingResponse:
-    """Stream real-time alerts (high-priority emails, upcoming events) via SSE."""
-    return StreamingResponse(
-        subscribe(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
 
 
 @mcp.custom_route("/ready", methods=["GET"])

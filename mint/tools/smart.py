@@ -494,7 +494,6 @@ def register_smart_tools(mcp: FastMCP) -> None:
 
         Example: server_status() — returns {"status": "healthy", "version": "2.0.0", "uptime_seconds": 3600, ...}"""
         from mint.config import get_settings
-        from mint.notifications import subscriber_count
 
         settings = get_settings()
         return {
@@ -504,7 +503,6 @@ def register_smart_tools(mcp: FastMCP) -> None:
             "uptime_seconds": round(time.monotonic() - _MODULE_START),
             "providers": ["google", "microsoft"],
             "tools_count": 10,
-            "sse_subscribers": subscriber_count(),
             "compliance": {
                 "encryption_in_transit": "TLS 1.3 (Azure-managed)",
                 "data_at_rest": "none (stateless — no email content persisted)",
