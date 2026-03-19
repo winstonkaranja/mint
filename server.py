@@ -124,6 +124,38 @@ async def readiness_check(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ready"})
 
 
+@mcp.custom_route("/schemas", methods=["GET"])
+async def schemas(request: Request) -> JSONResponse:
+    """Machine-readable JSON Schema for all Mint response models."""
+    from mint.errors import MintError
+    from mint.models import (
+        CalendarEvent,
+        DailyBrief,
+        DaySummary,
+        DraftSummary,
+        EmailThread,
+        EnrichedEvent,
+        PriorityEmail,
+        ScoringOverrides,
+        ThreadMessage,
+        WeeklyDigest,
+    )
+
+    return JSONResponse({
+        "daily_brief": DailyBrief.model_json_schema(),
+        "day_summary": DaySummary.model_json_schema(),
+        "weekly_digest": WeeklyDigest.model_json_schema(),
+        "priority_email": PriorityEmail.model_json_schema(),
+        "enriched_event": EnrichedEvent.model_json_schema(),
+        "email_thread": EmailThread.model_json_schema(),
+        "thread_message": ThreadMessage.model_json_schema(),
+        "draft_summary": DraftSummary.model_json_schema(),
+        "calendar_event": CalendarEvent.model_json_schema(),
+        "scoring_overrides": ScoringOverrides.model_json_schema(),
+        "error": MintError.model_json_schema(),
+    })
+
+
 # ---------------------------------------------------------------------------
 # SCIM 2.0 User provisioning (RFC 7644)
 # ---------------------------------------------------------------------------
