@@ -22,9 +22,15 @@ class OutlookProvider:
         self.client = client
         self.headers = {"Authorization": f"Bearer {token}"}
 
-    async def get_inbox(self, max_results: int = 20) -> list[EmailSummary]:
+    def _base(self, mailbox: str | None = None) -> str:
+        if mailbox:
+            return f"https://graph.microsoft.com/v1.0/users/{mailbox}"
+        return GRAPH_BASE
+
+    async def get_inbox(self, max_results: int = 20, mailbox: str | None = None) -> list[EmailSummary]:
+        base = self._base(mailbox)
         resp = await self.client.get(
-            f"{GRAPH_BASE}/messages",
+            f"{base}/messages",
             headers=self.headers,
             params={
                 "$top": max_results,
@@ -35,9 +41,10 @@ class OutlookProvider:
         resp.raise_for_status()
         return [self._to_summary(m) for m in resp.json().get("value", [])]
 
-    async def get_email(self, email_id: str) -> Email:
+    async def get_email(self, email_id: str, mailbox: str | None = None) -> Email:
+        base = self._base(mailbox)
         resp = await self.client.get(
-            f"{GRAPH_BASE}/messages/{email_id}",
+            f"{base}/messages/{email_id}",
             headers=self.headers,
             params={"$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,isRead"},
         )
@@ -54,7 +61,8 @@ class OutlookProvider:
             is_read=data.get("isRead", False),
         )
 
-    async def draft_email(self, request: DraftEmailRequest) -> str:
+    async def draft_email(self, request: DraftEmailRequest, mailbox: str | None = None) -> str:
+        base = self._base(mailbox)
         body: dict = {
             "subject": request.subject,
             "body": {"contentType": "Text", "content": request.body},
@@ -71,7 +79,7 @@ class OutlookProvider:
                 {"emailAddress": {"address": a}} for a in request.bcc
             ]
         resp = await self.client.post(
-            f"{GRAPH_BASE}/messages",
+            f"{base}/messages",
             headers=self.headers,
             json=body,
         )
@@ -79,10 +87,11 @@ class OutlookProvider:
         return resp.json()["id"]
 
     async def search_emails(
-        self, query: str, max_results: int = 20
+        self, query: str, max_results: int = 20, mailbox: str | None = None
     ) -> list[EmailSummary]:
+        base = self._base(mailbox)
         resp = await self.client.get(
-            f"{GRAPH_BASE}/messages",
+            f"{base}/messages",
             headers=self.headers,
             params={
                 "$search": f'"{query}"',
@@ -93,10 +102,11 @@ class OutlookProvider:
         resp.raise_for_status()
         return [self._to_summary(m) for m in resp.json().get("value", [])]
 
-    async def get_thread_messages(self, email_id: str) -> list[dict]:
+    async def get_thread_messages(self, email_id: str, mailbox: str | None = None) -> list[dict]:
+        base = self._base(mailbox)
         # Fetch the message to get its conversationId
         resp = await self.client.get(
-            f"{GRAPH_BASE}/messages/{email_id}",
+            f"{base}/messages/{email_id}",
             headers=self.headers,
             params={"$select": "conversationId"},
         )
@@ -106,7 +116,7 @@ class OutlookProvider:
             return []
         # Fetch all messages in the conversation
         resp = await self.client.get(
-            f"{GRAPH_BASE}/messages",
+            f"{base}/messages",
             headers=self.headers,
             params={
                 "$filter": f"conversationId eq '{conv_id}'",
@@ -127,9 +137,10 @@ class OutlookProvider:
             })
         return messages
 
-    async def list_drafts(self, max_results: int = 20) -> list[DraftSummary]:
+    async def list_drafts(self, max_results: int = 20, mailbox: str | None = None) -> list[DraftSummary]:
+        base = self._base(mailbox)
         resp = await self.client.get(
-            f"{GRAPH_BASE}/mailFolders/Drafts/messages",
+            f"{base}/mailFolders/Drafts/messages",
             headers=self.headers,
             params={
                 "$top": max_results,
@@ -180,35 +191,43 @@ class MicrosoftCalendarProvider:
         self.client = client
         self.headers = {"Authorization": f"Bearer {token}"}
 
+    def _base(self, mailbox: str | None = None) -> str:
+        if mailbox:
+            return f"https://graph.microsoft.com/v1.0/users/{mailbox}"
+        return GRAPH_BASE
+
     async def list_events(
-        self, start: datetime, end: datetime, max_results: int = 20
+        self, start: datetime, end: datetime, max_results: int = 20, mailbox: str | None = None
     ) -> list[CalendarEvent]:
+        base = self._base(mailbox)
         resp = await self.client.get(
-            f"{GRAPH_BASE}/calendarView",
+            f"{base}/calendarView",
             headers=self.headers,
             params={
                 "startDateTime": start.isoformat() + "Z",
                 "endDateTime": end.isoformat() + "Z",
                 "$top": max_results,
                 "$orderby": "start/dateTime",
-                "$select": "id,subject,start,end,location,body,attendees,isAllDay",
+                "$select": "id,subject,start,end,location,body,attendees,isAllDay,seriesMasterId",
             },
         )
         resp.raise_for_status()
         return [self._parse_event(e) for e in resp.json().get("value", [])]
 
-    async def get_event(self, event_id: str) -> CalendarEvent:
+    async def get_event(self, event_id: str, mailbox: str | None = None) -> CalendarEvent:
+        base = self._base(mailbox)
         resp = await self.client.get(
-            f"{GRAPH_BASE}/events/{event_id}",
+            f"{base}/events/{event_id}",
             headers=self.headers,
         )
         resp.raise_for_status()
         return self._parse_event(resp.json())
 
-    async def create_event(self, request: CreateEventRequest) -> CalendarEvent:
+    async def create_event(self, request: CreateEventRequest, mailbox: str | None = None) -> CalendarEvent:
+        base = self._base(mailbox)
         body = self._build_event_body(request)
         resp = await self.client.post(
-            f"{GRAPH_BASE}/events",
+            f"{base}/events",
             headers=self.headers,
             json=body,
         )
@@ -216,20 +235,22 @@ class MicrosoftCalendarProvider:
         return self._parse_event(resp.json())
 
     async def update_event(
-        self, event_id: str, request: UpdateEventRequest
+        self, event_id: str, request: UpdateEventRequest, mailbox: str | None = None
     ) -> CalendarEvent:
+        base = self._base(mailbox)
         body = self._build_patch_body(request)
         resp = await self.client.patch(
-            f"{GRAPH_BASE}/events/{event_id}",
+            f"{base}/events/{event_id}",
             headers=self.headers,
             json=body,
         )
         resp.raise_for_status()
         return self._parse_event(resp.json())
 
-    async def delete_event(self, event_id: str) -> bool:
+    async def delete_event(self, event_id: str, mailbox: str | None = None) -> bool:
+        base = self._base(mailbox)
         resp = await self.client.delete(
-            f"{GRAPH_BASE}/events/{event_id}",
+            f"{base}/events/{event_id}",
             headers=self.headers,
         )
         resp.raise_for_status()
@@ -251,6 +272,7 @@ class MicrosoftCalendarProvider:
                 for a in data.get("attendees", [])
             ],
             is_all_day=data.get("isAllDay", False),
+            recurring_event_id=data.get("seriesMasterId"),
         )
 
     @staticmethod

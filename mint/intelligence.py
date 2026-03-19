@@ -435,6 +435,13 @@ def rank_emails(
         group.sort(key=lambda p: p.score, reverse=True)
         representative = group[0]
         representative.message_count = len(group)
+        # Aggregate thread participants and track last reply
+        all_participants: set[str] = set()
+        for p in group:
+            all_participants.add(extract_email_address(p.sender))
+        representative.participants = sorted(all_participants)
+        newest = max(group, key=lambda p: p.date)
+        representative.last_reply_by = newest.sender
         deduplicated.append(representative)
 
     # Subject+sender dedup: collapse near-identical automated emails
@@ -454,6 +461,12 @@ def rank_emails(
         group.sort(key=lambda p: p.score, reverse=True)
         best = group[0]
         best.message_count = sum(p.message_count for p in group)
+        all_participants = set()
+        for p in group:
+            all_participants.update(p.participants or [extract_email_address(p.sender)])
+        best.participants = sorted(all_participants)
+        newest = max(group, key=lambda p: p.date)
+        best.last_reply_by = newest.last_reply_by or newest.sender
         unique.append(best)
 
     deduplicated = unique
@@ -610,9 +623,38 @@ def enrich_events(
                 start_local=start_local,
                 end_local=end_local,
                 prep_bundle=prep_bundle,
+                recurring_event_id=event.recurring_event_id,
             )
         )
+
+    # Annotate recurring events with occurrence count within fetched window
+    series_indices: dict[str, list[int]] = defaultdict(list)
+    for i, event in enumerate(events):
+        if event.recurring_event_id:
+            series_indices[event.recurring_event_id].append(i)
+
+    for indices in series_indices.values():
+        total = len(indices)
+        for position, idx in enumerate(indices, 1):
+            result[idx].is_recurring = True
+            result[idx].recurrence_label = (
+                f"Recurring ({position} of {total} this window)" if total > 1 else "Recurring"
+            )
+
+    detect_conflicts(result)
     return result
+
+
+def detect_conflicts(events: list[EnrichedEvent]) -> None:
+    """Flag overlapping timed events in-place. All-day events excluded."""
+    timed = [e for e in events if not e.is_all_day]
+    for i, a in enumerate(timed):
+        for b in timed[i + 1:]:
+            if a.start < b.end and b.start < a.end:
+                if b.title not in a.conflicts_with:
+                    a.conflicts_with.append(b.title)
+                if a.title not in b.conflicts_with:
+                    b.conflicts_with.append(a.title)
 
 
 def generate_highlights(
@@ -638,6 +680,13 @@ def generate_highlights(
                 f"{event.unread_from_attendees} unread email(s) from attendees "
                 f"of \"{event.title}\" (starts {time_str})"
             )
+
+    # Schedule conflicts
+    conflicting = [e for e in events if e.conflicts_with]
+    for event in conflicting:
+        others = ", ".join(f'"{t}"' for t in event.conflicts_with)
+        time_str = _format_local_time(event.start, tz) if tz else event.start.strftime("%I:%M %p")
+        highlights.append(f'Schedule conflict: "{event.title}" ({time_str}) overlaps with {others}')
 
     # Top urgent emails
     urgent = [e for e in emails if e.score >= 0.65]

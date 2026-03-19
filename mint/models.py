@@ -60,6 +60,7 @@ class CalendarEvent(BaseModel):
     description: str | None = None
     attendees: list[str] = []
     is_all_day: bool = False
+    recurring_event_id: str | None = None
 
 
 class CreateEventRequest(BaseModel):
@@ -109,6 +110,8 @@ class PriorityEmail(BaseModel):
     thread_id: str | None = None
     awaiting_reply: bool = False
     awaiting_reply_hours: int | None = None
+    participants: list[str] = []
+    last_reply_by: str | None = None
 
 
 class AttendeeEmail(BaseModel):
@@ -138,6 +141,10 @@ class EnrichedEvent(BaseModel):
     start_local: str | None = None
     end_local: str | None = None
     prep_bundle: PrepBundle | None = None
+    conflicts_with: list[str] = []
+    recurring_event_id: str | None = None
+    is_recurring: bool = False
+    recurrence_label: str | None = None
 
 
 class DailyBrief(BaseModel):

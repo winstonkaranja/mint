@@ -25,19 +25,26 @@ class GmailProvider:
         self.client = client
         self.headers = {"Authorization": f"Bearer {token}"}
 
-    async def get_inbox(self, max_results: int = 20) -> list[EmailSummary]:
+    def _email_base(self, mailbox: str | None = None) -> str:
+        if mailbox:
+            return f"https://gmail.googleapis.com/gmail/v1/users/{mailbox}"
+        return GMAIL_BASE
+
+    async def get_inbox(self, max_results: int = 20, mailbox: str | None = None) -> list[EmailSummary]:
+        base = self._email_base(mailbox)
         resp = await self.client.get(
-            f"{GMAIL_BASE}/messages",
+            f"{base}/messages",
             headers=self.headers,
             params={"maxResults": max_results, "labelIds": "INBOX"},
         )
         resp.raise_for_status()
         messages = resp.json().get("messages", [])
-        return [await self._to_summary(m["id"]) for m in messages]
+        return [await self._to_summary(m["id"], mailbox=mailbox) for m in messages]
 
-    async def get_email(self, email_id: str) -> Email:
+    async def get_email(self, email_id: str, mailbox: str | None = None) -> Email:
+        base = self._email_base(mailbox)
         resp = await self.client.get(
-            f"{GMAIL_BASE}/messages/{email_id}",
+            f"{base}/messages/{email_id}",
             headers=self.headers,
             params={"format": "full"},
         )
@@ -56,7 +63,8 @@ class GmailProvider:
             is_read="UNREAD" not in data.get("labelIds", []),
         )
 
-    async def draft_email(self, request: DraftEmailRequest) -> str:
+    async def draft_email(self, request: DraftEmailRequest, mailbox: str | None = None) -> str:
+        base = self._email_base(mailbox)
         msg = MIMEText(request.body)
         msg["To"] = ", ".join(request.to)
         msg["Subject"] = request.subject
@@ -66,7 +74,7 @@ class GmailProvider:
             msg["Bcc"] = ", ".join(request.bcc)
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         resp = await self.client.post(
-            f"{GMAIL_BASE}/drafts",
+            f"{base}/drafts",
             headers=self.headers,
             json={"message": {"raw": raw}},
         )
@@ -74,21 +82,23 @@ class GmailProvider:
         return resp.json()["id"]
 
     async def search_emails(
-        self, query: str, max_results: int = 20
+        self, query: str, max_results: int = 20, mailbox: str | None = None
     ) -> list[EmailSummary]:
+        base = self._email_base(mailbox)
         resp = await self.client.get(
-            f"{GMAIL_BASE}/messages",
+            f"{base}/messages",
             headers=self.headers,
             params={"q": query, "maxResults": max_results},
         )
         resp.raise_for_status()
         messages = resp.json().get("messages", [])
-        return [await self._to_summary(m["id"]) for m in messages]
+        return [await self._to_summary(m["id"], mailbox=mailbox) for m in messages]
 
-    async def get_thread_messages(self, email_id: str) -> list[dict]:
+    async def get_thread_messages(self, email_id: str, mailbox: str | None = None) -> list[dict]:
+        base = self._email_base(mailbox)
         # Fetch the message to get its threadId
         resp = await self.client.get(
-            f"{GMAIL_BASE}/messages/{email_id}",
+            f"{base}/messages/{email_id}",
             headers=self.headers,
             params={"format": "metadata", "metadataHeaders": ["From"]},
         )
@@ -98,7 +108,7 @@ class GmailProvider:
             return []
         # Fetch the full thread
         resp = await self.client.get(
-            f"{GMAIL_BASE}/threads/{thread_id}",
+            f"{base}/threads/{thread_id}",
             headers=self.headers,
             params={"format": "full"},
         )
@@ -116,9 +126,10 @@ class GmailProvider:
             })
         return messages
 
-    async def list_drafts(self, max_results: int = 20) -> list[DraftSummary]:
+    async def list_drafts(self, max_results: int = 20, mailbox: str | None = None) -> list[DraftSummary]:
+        base = self._email_base(mailbox)
         resp = await self.client.get(
-            f"{GMAIL_BASE}/drafts",
+            f"{base}/drafts",
             headers=self.headers,
             params={"maxResults": max_results},
         )
@@ -128,7 +139,7 @@ class GmailProvider:
         for draft in drafts:
             msg_id = draft["message"]["id"]
             msg_resp = await self.client.get(
-                f"{GMAIL_BASE}/messages/{msg_id}",
+                f"{base}/messages/{msg_id}",
                 headers=self.headers,
                 params={"format": "metadata", "metadataHeaders": ["Subject", "To", "Date"]},
             )
@@ -144,9 +155,10 @@ class GmailProvider:
             ))
         return results
 
-    async def _to_summary(self, message_id: str) -> EmailSummary:
+    async def _to_summary(self, message_id: str, mailbox: str | None = None) -> EmailSummary:
+        base = self._email_base(mailbox)
         resp = await self.client.get(
-            f"{GMAIL_BASE}/messages/{message_id}",
+            f"{base}/messages/{message_id}",
             headers=self.headers,
             params={"format": "metadata", "metadataHeaders": ["Subject", "From", "Date"]},
         )
@@ -198,11 +210,17 @@ class GoogleCalendarProvider:
         self.client = client
         self.headers = {"Authorization": f"Bearer {token}"}
 
+    def _cal_base(self, mailbox: str | None = None) -> str:
+        if mailbox:
+            return f"https://www.googleapis.com/calendar/v3/calendars/{mailbox}"
+        return GCAL_BASE
+
     async def list_events(
-        self, start: datetime, end: datetime, max_results: int = 20
+        self, start: datetime, end: datetime, max_results: int = 20, mailbox: str | None = None
     ) -> list[CalendarEvent]:
+        base = self._cal_base(mailbox)
         resp = await self.client.get(
-            f"{GCAL_BASE}/events",
+            f"{base}/events",
             headers=self.headers,
             params={
                 "timeMin": _to_rfc3339_utc(start),
@@ -215,18 +233,20 @@ class GoogleCalendarProvider:
         resp.raise_for_status()
         return [self._parse_event(e) for e in resp.json().get("items", [])]
 
-    async def get_event(self, event_id: str) -> CalendarEvent:
+    async def get_event(self, event_id: str, mailbox: str | None = None) -> CalendarEvent:
+        base = self._cal_base(mailbox)
         resp = await self.client.get(
-            f"{GCAL_BASE}/events/{event_id}",
+            f"{base}/events/{event_id}",
             headers=self.headers,
         )
         resp.raise_for_status()
         return self._parse_event(resp.json())
 
-    async def create_event(self, request: CreateEventRequest) -> CalendarEvent:
+    async def create_event(self, request: CreateEventRequest, mailbox: str | None = None) -> CalendarEvent:
+        base = self._cal_base(mailbox)
         body = self._build_event_body(request)
         resp = await self.client.post(
-            f"{GCAL_BASE}/events",
+            f"{base}/events",
             headers=self.headers,
             json=body,
         )
@@ -234,20 +254,22 @@ class GoogleCalendarProvider:
         return self._parse_event(resp.json())
 
     async def update_event(
-        self, event_id: str, request: UpdateEventRequest
+        self, event_id: str, request: UpdateEventRequest, mailbox: str | None = None
     ) -> CalendarEvent:
+        base = self._cal_base(mailbox)
         body = self._build_patch_body(request)
         resp = await self.client.patch(
-            f"{GCAL_BASE}/events/{event_id}",
+            f"{base}/events/{event_id}",
             headers=self.headers,
             json=body,
         )
         resp.raise_for_status()
         return self._parse_event(resp.json())
 
-    async def delete_event(self, event_id: str) -> bool:
+    async def delete_event(self, event_id: str, mailbox: str | None = None) -> bool:
+        base = self._cal_base(mailbox)
         resp = await self.client.delete(
-            f"{GCAL_BASE}/events/{event_id}",
+            f"{base}/events/{event_id}",
             headers=self.headers,
         )
         resp.raise_for_status()
@@ -271,6 +293,7 @@ class GoogleCalendarProvider:
                 a.get("email", "") for a in data.get("attendees", [])
             ],
             is_all_day=is_all_day,
+            recurring_event_id=data.get("recurringEventId"),
         )
 
     @staticmethod
