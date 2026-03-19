@@ -625,7 +625,21 @@ def enrich_events(
                 prep_bundle=prep_bundle,
             )
         )
+
+    detect_conflicts(result)
     return result
+
+
+def detect_conflicts(events: list[EnrichedEvent]) -> None:
+    """Flag overlapping timed events in-place. All-day events excluded."""
+    timed = [e for e in events if not e.is_all_day]
+    for i, a in enumerate(timed):
+        for b in timed[i + 1:]:
+            if a.start < b.end and b.start < a.end:
+                if b.title not in a.conflicts_with:
+                    a.conflicts_with.append(b.title)
+                if a.title not in b.conflicts_with:
+                    b.conflicts_with.append(a.title)
 
 
 def generate_highlights(
@@ -651,6 +665,13 @@ def generate_highlights(
                 f"{event.unread_from_attendees} unread email(s) from attendees "
                 f"of \"{event.title}\" (starts {time_str})"
             )
+
+    # Schedule conflicts
+    conflicting = [e for e in events if e.conflicts_with]
+    for event in conflicting:
+        others = ", ".join(f'"{t}"' for t in event.conflicts_with)
+        time_str = _format_local_time(event.start, tz) if tz else event.start.strftime("%I:%M %p")
+        highlights.append(f'Schedule conflict: "{event.title}" ({time_str}) overlaps with {others}')
 
     # Top urgent emails
     urgent = [e for e in emails if e.score >= 0.65]

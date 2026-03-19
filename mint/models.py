@@ -140,6 +140,7 @@ class EnrichedEvent(BaseModel):
     start_local: str | None = None
     end_local: str | None = None
     prep_bundle: PrepBundle | None = None
+    conflicts_with: list[str] = []
 
 
 class DailyBrief(BaseModel):
