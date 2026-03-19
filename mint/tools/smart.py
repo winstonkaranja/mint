@@ -233,14 +233,6 @@ def register_smart_tools(mcp: FastMCP) -> None:
                     "Remove or redact sensitive data before drafting",
                 )
 
-            # DLP scan before drafting
-            findings = scan_for_sensitive_content(body)
-            if findings:
-                raise invalid_input(
-                    f"Draft blocked: sensitive content detected — {', '.join(findings)}",
-                    "Remove or redact sensitive data before drafting",
-                )
-
             request = DraftEmailRequest(
                 to=[original.sender],
                 subject=subject,
