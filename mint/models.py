@@ -109,6 +109,8 @@ class PriorityEmail(BaseModel):
     thread_id: str | None = None
     awaiting_reply: bool = False
     awaiting_reply_hours: int | None = None
+    participants: list[str] = []
+    last_reply_by: str | None = None
 
 
 class AttendeeEmail(BaseModel):

@@ -435,6 +435,13 @@ def rank_emails(
         group.sort(key=lambda p: p.score, reverse=True)
         representative = group[0]
         representative.message_count = len(group)
+        # Aggregate thread participants and track last reply
+        all_participants: set[str] = set()
+        for p in group:
+            all_participants.add(extract_email_address(p.sender))
+        representative.participants = sorted(all_participants)
+        newest = max(group, key=lambda p: p.date)
+        representative.last_reply_by = newest.sender
         deduplicated.append(representative)
 
     # Subject+sender dedup: collapse near-identical automated emails
@@ -454,6 +461,12 @@ def rank_emails(
         group.sort(key=lambda p: p.score, reverse=True)
         best = group[0]
         best.message_count = sum(p.message_count for p in group)
+        all_participants = set()
+        for p in group:
+            all_participants.update(p.participants or [extract_email_address(p.sender)])
+        best.participants = sorted(all_participants)
+        newest = max(group, key=lambda p: p.date)
+        best.last_reply_by = newest.last_reply_by or newest.sender
         unique.append(best)
 
     deduplicated = unique
