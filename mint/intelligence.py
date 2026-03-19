@@ -357,6 +357,31 @@ def score_email(
     )
 
 
+_SUBJECT_NOISE_RE = re.compile(
+    r"\$[\d,]+\.?\d*"       # dollar amounts ($19.14, $1,234.56)
+    r"|#\d+"                # ticket/order numbers (#12345)
+    r"|\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b"  # dates (3/19, 03-19-2026)
+    r"|\b\d+\b",            # standalone numbers
+    re.IGNORECASE,
+)
+
+
+def _normalize_subject(subject: str) -> str:
+    """Strip noise and truncate to first 2 words for near-match grouping.
+
+    Same sender + same first 2 meaningful words = same type of email.
+    Strips numbers, dollar amounts, dates, path-like tokens (repo/URL),
+    and punctuation-only tokens before taking the first 2 words.
+    """
+    s = subject.lower().strip()
+    s = re.sub(r"^(re|fwd|fw)\s*:\s*", "", s)
+    s = _SUBJECT_NOISE_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # Strip path-like tokens (repo/url paths) and punctuation-only tokens
+    words = [w for w in s.split() if "/" not in w and re.search(r"[a-z]", w)]
+    return " ".join(words[:2])
+
+
 def rank_emails(
     emails: list[EmailSummary],
     events: list[CalendarEvent],
@@ -411,6 +436,27 @@ def rank_emails(
         representative = group[0]
         representative.message_count = len(group)
         deduplicated.append(representative)
+
+    # Subject+sender dedup: collapse near-identical automated emails
+    # (same sender, same normalized subject) into one entry.
+    subject_groups: dict[tuple[str, str], list[PriorityEmail]] = {}
+    unique: list[PriorityEmail] = []
+    for p in deduplicated:
+        addr = extract_email_address(p.sender)
+        norm = _normalize_subject(p.subject)
+        key = (addr, norm)
+        if norm:
+            subject_groups.setdefault(key, []).append(p)
+        else:
+            unique.append(p)
+
+    for group in subject_groups.values():
+        group.sort(key=lambda p: p.score, reverse=True)
+        best = group[0]
+        best.message_count = sum(p.message_count for p in group)
+        unique.append(best)
+
+    deduplicated = unique
 
     deduplicated.sort(key=lambda p: p.score, reverse=True)
 
