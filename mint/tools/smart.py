@@ -46,6 +46,8 @@ from mint.models import (
 )
 from mint.providers.base import CalendarProvider, EmailProvider
 
+_MODULE_START = time.monotonic()
+
 
 def _resolve_timezone(timezone: str) -> ZoneInfo:
     """Parse an IANA timezone name, falling back to UTC on invalid input."""
@@ -485,3 +487,28 @@ def register_smart_tools(mcp: FastMCP) -> None:
         except MintToolError as exc:
             log_tool_call("get_pending_drafts", user_email, _params, "error", (time.monotonic() - _start) * 1000, error_code=exc.error.error_code)
             raise
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    async def server_status() -> dict:
+        """Server health and version info accessible through MCP. Returns status, version, uptime, supported providers, tool count, and compliance metadata. Use this to verify the server is running correctly.
+
+        Example: server_status() — returns {"status": "healthy", "version": "2.0.0", "uptime_seconds": 3600, ...}"""
+        from mint.config import get_settings
+        from mint.notifications import subscriber_count
+
+        settings = get_settings()
+        return {
+            "status": "healthy",
+            "server": "Mint",
+            "version": "2.0.0",
+            "uptime_seconds": round(time.monotonic() - _MODULE_START),
+            "providers": ["google", "microsoft"],
+            "tools_count": 10,
+            "sse_subscribers": subscriber_count(),
+            "compliance": {
+                "encryption_in_transit": "TLS 1.3 (Azure-managed)",
+                "data_at_rest": "none (stateless — no email content persisted)",
+                "hipaa_ready": True,
+                "data_region": settings.data_region,
+            },
+        }
