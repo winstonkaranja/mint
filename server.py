@@ -3,11 +3,10 @@ import time
 
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from mint.auth import MintProvider
 from mint.config import get_settings
-from mint.notifications import subscribe, subscriber_count
 from mint.pages import landing_page_html, tools_docs_html
 from mint.scim import (
     scim_create_user,
@@ -94,7 +93,6 @@ async def health_check(request: Request) -> JSONResponse:
         "uptime_seconds": round(time.monotonic() - _start_time),
         "providers": _PROVIDERS,
         "tools_count": _TOOLS_COUNT,
-        "sse_subscribers": subscriber_count(),
         "compliance": {
             "encryption_in_transit": "TLS 1.3 (Azure-managed)",
             "data_at_rest": "none (stateless — no email content persisted)",
@@ -105,23 +103,41 @@ async def health_check(request: Request) -> JSONResponse:
     return JSONResponse(health)
 
 
-@mcp.custom_route("/notifications", methods=["GET"])
-async def sse_notifications(request: Request) -> StreamingResponse:
-    """Stream real-time alerts (high-priority emails, upcoming events) via SSE."""
-    return StreamingResponse(
-        subscribe(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
 @mcp.custom_route("/ready", methods=["GET"])
 async def readiness_check(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ready"})
+
+
+@mcp.custom_route("/schemas", methods=["GET"])
+async def schemas(request: Request) -> JSONResponse:
+    """Machine-readable JSON Schema for all Mint response models."""
+    from mint.errors import MintError
+    from mint.models import (
+        CalendarEvent,
+        DailyBrief,
+        DaySummary,
+        DraftSummary,
+        EmailThread,
+        EnrichedEvent,
+        PriorityEmail,
+        ScoringOverrides,
+        ThreadMessage,
+        WeeklyDigest,
+    )
+
+    return JSONResponse({
+        "daily_brief": DailyBrief.model_json_schema(),
+        "day_summary": DaySummary.model_json_schema(),
+        "weekly_digest": WeeklyDigest.model_json_schema(),
+        "priority_email": PriorityEmail.model_json_schema(),
+        "enriched_event": EnrichedEvent.model_json_schema(),
+        "email_thread": EmailThread.model_json_schema(),
+        "thread_message": ThreadMessage.model_json_schema(),
+        "draft_summary": DraftSummary.model_json_schema(),
+        "calendar_event": CalendarEvent.model_json_schema(),
+        "scoring_overrides": ScoringOverrides.model_json_schema(),
+        "error": MintError.model_json_schema(),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -154,4 +170,4 @@ async def scim_update(request: Request) -> JSONResponse:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)

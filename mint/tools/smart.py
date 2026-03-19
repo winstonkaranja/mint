@@ -46,6 +46,8 @@ from mint.models import (
 )
 from mint.providers.base import CalendarProvider, EmailProvider
 
+_MODULE_START = time.monotonic()
+
 
 def _resolve_timezone(timezone: str) -> ZoneInfo:
     """Parse an IANA timezone name, falling back to UTC on invalid input."""
@@ -75,7 +77,9 @@ def register_smart_tools(mcp: FastMCP) -> None:
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> DailyBrief:
-        """Morning snapshot: today's meetings enriched with related unread emails, top priority emails scored by urgency, and cross-referenced highlights. One call replaces reading inbox + checking calendar."""
+        """Morning snapshot: today's meetings enriched with related unread emails, top priority emails scored by urgency, and cross-referenced highlights. One call replaces reading inbox + checking calendar.
+
+        Example: get_daily_brief(timezone="Africa/Nairobi") — returns brief with times as "9:00 AM EAT". Pass scoring_overrides to boost/demote specific senders or domains."""
         _start = time.monotonic()
         _params = {"timezone": timezone}
         try:
@@ -133,7 +137,9 @@ def register_smart_tools(mcp: FastMCP) -> None:
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> list[PriorityEmail]:
-        """Top emails scored by urgency. Each email gets a 0.0-1.0 priority score based on calendar relevance, urgency keywords, recency, and thread activity. Returns the top results, not the full inbox."""
+        """Top emails scored by urgency. Each email gets a 0.0-1.0 priority score based on calendar relevance, urgency keywords, recency, and thread activity. Returns the top results, not the full inbox.
+
+        Example: get_priority_emails(limit=5) — top 5 emails. With overrides: get_priority_emails(scoring_overrides={"boost_senders": ["ceo@company.com"], "demote_domains": ["marketing.com"]})"""
         _start = time.monotonic()
         _params = {"limit": limit}
         try:
@@ -163,7 +169,9 @@ def register_smart_tools(mcp: FastMCP) -> None:
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
     ) -> EmailThread:
-        """Get the full conversation thread for an email. Returns all messages in the thread with sender, date, and body."""
+        """Get the full conversation thread for an email. Returns all messages in the thread with sender, date, and body.
+
+        Example: get_email_thread(email_id="18f3a4b2c1d0e5f6") — returns all messages in that thread. Use an email ID from get_priority_emails or get_daily_brief results."""
         _start = time.monotonic()
         _params = {"email_id": email_id}
         try:
@@ -210,7 +218,9 @@ def register_smart_tools(mcp: FastMCP) -> None:
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
     ) -> str:
-        """Draft a reply to an email. Reads the original email, creates a reply draft with Re: subject addressed to the sender. Never sends — the user reviews and sends from their mail client. Returns the draft ID."""
+        """Draft a reply to an email. Reads the original email, creates a reply draft with Re: subject addressed to the sender. Never sends — the user reviews and sends from their mail client. Returns the draft ID. Body is scanned for sensitive content (SSNs, credit cards, API keys) before drafting.
+
+        Example: draft_email_reply(email_id="18f3a4b2c1d0e5f6", body="Thanks, I'll review by Friday.")"""
         _start = time.monotonic()
         _params = {"email_id": email_id, "body": body, "cc": cc, "bcc": bcc}
         try:
@@ -230,14 +240,6 @@ def register_smart_tools(mcp: FastMCP) -> None:
             if findings:
                 raise invalid_input(
                     f"Draft blocked: sensitive content detected \N{EM DASH} {', '.join(findings)}",
-                    "Remove or redact sensitive data before drafting",
-                )
-
-            # DLP scan before drafting
-            findings = scan_for_sensitive_content(body)
-            if findings:
-                raise invalid_input(
-                    f"Draft blocked: sensitive content detected — {', '.join(findings)}",
                     "Remove or redact sensitive data before drafting",
                 )
 
@@ -270,7 +272,9 @@ def register_smart_tools(mcp: FastMCP) -> None:
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> list[EnrichedEvent]:
-        """Calendar events for the next N days, enriched with unread email counts from attendees. Shows which meetings have related unread emails so you can prepare."""
+        """Calendar events for the next N days, enriched with unread email counts from attendees. Shows which meetings have related unread emails so you can prepare.
+
+        Example: get_upcoming_events(days=3, timezone="US/Eastern") — next 3 days with times in ET."""
         _start = time.monotonic()
         _params = {"days": days, "timezone": timezone}
         try:
@@ -304,7 +308,9 @@ def register_smart_tools(mcp: FastMCP) -> None:
         user_email: str | None = Depends(get_user_email),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> CalendarEvent:
-        """Create a personal calendar reminder. Sets a 30-minute event with no attendees. Use for tasks, follow-ups, or prep reminders."""
+        """Create a personal calendar reminder. Sets a 30-minute event with no attendees. Use for tasks, follow-ups, or prep reminders.
+
+        Example: create_reminder(title="Review Q3 budget", start="2026-03-20T09:00:00", description="Check billing alerts")"""
         _start_t = time.monotonic()
         _params = {"title": title, "start": start, "description": description}
         try:
@@ -343,7 +349,9 @@ def register_smart_tools(mcp: FastMCP) -> None:
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> DaySummary:
-        """End-of-day summary: emails received, unread count, today's meetings with attendee email activity, pending high-priority emails, tomorrow's first events, and suggested action items."""
+        """End-of-day summary: emails received, unread count, today's meetings with attendee email activity, pending high-priority emails, tomorrow's first events, and suggested action items.
+
+        Example: summarize_day(timezone="Europe/London") — summary with times in GMT/BST."""
         _start = time.monotonic()
         _params = {"timezone": timezone}
         try:
@@ -404,7 +412,9 @@ def register_smart_tools(mcp: FastMCP) -> None:
         email_provider: EmailProvider = Depends(get_email_provider),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> WeeklyDigest:
-        """Weekly activity digest: total emails and unread count, top 5 senders, busiest day by email volume, and total meetings over the past 7 days. One call for a quick retrospective."""
+        """Weekly activity digest: total emails and unread count, top 5 senders, busiest day by email volume, and total meetings over the past 7 days. One call for a quick retrospective.
+
+        Example: get_weekly_digest(timezone="Asia/Tokyo") — week summary with JST timestamps."""
         _start = time.monotonic()
         _params = {"timezone": timezone}
         try:
@@ -459,7 +469,9 @@ def register_smart_tools(mcp: FastMCP) -> None:
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
     ) -> list[DraftSummary]:
-        """List all email drafts so you can review AI-drafted replies before sending. Returns draft ID, subject, recipients, and a snippet for each pending draft."""
+        """List all email drafts so you can review AI-drafted replies before sending. Returns draft ID, subject, recipients, and a snippet for each pending draft.
+
+        Example: get_pending_drafts(max_results=5) — latest 5 drafts."""
         _start = time.monotonic()
         _params = {"max_results": max_results}
         try:
@@ -475,3 +487,26 @@ def register_smart_tools(mcp: FastMCP) -> None:
         except MintToolError as exc:
             log_tool_call("get_pending_drafts", user_email, _params, "error", (time.monotonic() - _start) * 1000, error_code=exc.error.error_code)
             raise
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    async def server_status() -> dict:
+        """Server health and version info accessible through MCP. Returns status, version, uptime, supported providers, tool count, and compliance metadata. Use this to verify the server is running correctly.
+
+        Example: server_status() — returns {"status": "healthy", "version": "2.0.0", "uptime_seconds": 3600, ...}"""
+        from mint.config import get_settings
+
+        settings = get_settings()
+        return {
+            "status": "healthy",
+            "server": "Mint",
+            "version": "2.0.0",
+            "uptime_seconds": round(time.monotonic() - _MODULE_START),
+            "providers": ["google", "microsoft"],
+            "tools_count": 10,
+            "compliance": {
+                "encryption_in_transit": "TLS 1.3 (Azure-managed)",
+                "data_at_rest": "none (stateless — no email content persisted)",
+                "hipaa_ready": True,
+                "data_region": settings.data_region,
+            },
+        }
