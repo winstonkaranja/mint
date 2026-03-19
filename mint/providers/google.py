@@ -271,6 +271,7 @@ class GoogleCalendarProvider:
                 a.get("email", "") for a in data.get("attendees", [])
             ],
             is_all_day=is_all_day,
+            recurring_event_id=data.get("recurringEventId"),
         )
 
     @staticmethod

@@ -623,8 +623,23 @@ def enrich_events(
                 start_local=start_local,
                 end_local=end_local,
                 prep_bundle=prep_bundle,
+                recurring_event_id=event.recurring_event_id,
             )
         )
+
+    # Annotate recurring events with occurrence count within fetched window
+    series_indices: dict[str, list[int]] = defaultdict(list)
+    for i, event in enumerate(events):
+        if event.recurring_event_id:
+            series_indices[event.recurring_event_id].append(i)
+
+    for indices in series_indices.values():
+        total = len(indices)
+        for position, idx in enumerate(indices, 1):
+            result[idx].is_recurring = True
+            result[idx].recurrence_label = (
+                f"Recurring ({position} of {total} this window)" if total > 1 else "Recurring"
+            )
 
     detect_conflicts(result)
     return result

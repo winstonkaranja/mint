@@ -60,6 +60,7 @@ class CalendarEvent(BaseModel):
     description: str | None = None
     attendees: list[str] = []
     is_all_day: bool = False
+    recurring_event_id: str | None = None
 
 
 class CreateEventRequest(BaseModel):
@@ -141,6 +142,9 @@ class EnrichedEvent(BaseModel):
     end_local: str | None = None
     prep_bundle: PrepBundle | None = None
     conflicts_with: list[str] = []
+    recurring_event_id: str | None = None
+    is_recurring: bool = False
+    recurrence_label: str | None = None
 
 
 class DailyBrief(BaseModel):

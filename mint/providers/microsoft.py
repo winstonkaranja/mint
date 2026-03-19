@@ -191,7 +191,7 @@ class MicrosoftCalendarProvider:
                 "endDateTime": end.isoformat() + "Z",
                 "$top": max_results,
                 "$orderby": "start/dateTime",
-                "$select": "id,subject,start,end,location,body,attendees,isAllDay",
+                "$select": "id,subject,start,end,location,body,attendees,isAllDay,seriesMasterId",
             },
         )
         resp.raise_for_status()
@@ -251,6 +251,7 @@ class MicrosoftCalendarProvider:
                 for a in data.get("attendees", [])
             ],
             is_all_day=data.get("isAllDay", False),
+            recurring_event_id=data.get("seriesMasterId"),
         )
 
     @staticmethod
