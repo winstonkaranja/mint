@@ -340,12 +340,13 @@ def register_smart_tools(mcp: FastMCP) -> None:
         title: str,
         start: datetime,
         description: str | None = None,
+        location: str | None = None,
         user_email: str | None = Depends(get_user_email),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> CalendarEvent:
         """Create a personal calendar reminder. Sets a 30-minute event with no attendees. Use for tasks, follow-ups, or prep reminders.
 
-        Example: create_reminder(title="Review Q3 budget", start="2026-03-20T09:00:00", description="Check billing alerts")"""
+        Example: create_reminder(title="Review Q3 budget", start="2026-03-20T09:00:00", description="Check billing alerts", location="KICC, Nairobi")"""
         _start_t = time.monotonic()
         _params = {"title": title, "start": start, "description": description}
         try:
@@ -359,6 +360,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
                 title=title,
                 start=start,
                 end=start + timedelta(minutes=30),
+                location=location,
                 description=description,
                 attendees=[],
             )

@@ -603,6 +603,34 @@ def build_travel_info(
     )
 
 
+def _extract_location_from_text(text: str) -> str | None:
+    """Try to extract a location from event title or description as fallback.
+
+    Looks for:
+    - "at <location>" or "@ <location>" patterns
+    - "Location: <location>" lines
+    - Virtual meeting URLs (Zoom, Teams, Meet, etc.)
+    """
+    # Virtual meeting URLs anywhere in text
+    match = _VIRTUAL_MEETING_RE.search(text)
+    if match:
+        return match.group(0)
+
+    # "Location: ..." line (common in calendar descriptions)
+    loc_match = re.search(r"(?:^|\n)\s*[Ll]ocation\s*:\s*(.+?)(?:\n|$)", text)
+    if loc_match:
+        return loc_match.group(1).strip()
+
+    # "at <Place>" pattern — require capitalized word after "at" to avoid false positives
+    at_match = re.search(r"\bat\s+([A-Z][A-Za-z0-9\s,.'()-]+?)(?:\s*[-\u2014]|\s*$|\.(?:\s|$))", text)
+    if at_match:
+        candidate = at_match.group(1).strip().rstrip(".,")
+        if len(candidate) >= 4:
+            return candidate
+
+    return None
+
+
 def enrich_events(
     events: list[CalendarEvent],
     emails: list[EmailSummary],
@@ -687,9 +715,15 @@ def enrich_events(
             start_local = _format_local_time(event.start, tz)
             end_local = _format_local_time(event.end, tz)
 
+        # Use explicit location field, or fall back to extracting from title/description
+        effective_location = event.location
+        if not effective_location:
+            fallback_text = f"{event.title}\n{event.description or ''}"
+            effective_location = _extract_location_from_text(fallback_text)
+
         travel_info = (
-            build_travel_info(event.location, origin=origin)
-            if event.location
+            build_travel_info(effective_location, origin=origin)
+            if effective_location
             else None
         )
 
