@@ -434,6 +434,29 @@ def register_smart_tools(mcp: FastMCP) -> None:
             enriched_today = enrich_events(today_events, emails, tz=tz, relationship_map=relationship_map, origin=origin)
             enriched_tomorrow = enrich_events(tomorrow_events, emails, tz=tz, relationship_map=relationship_map, origin=origin)
 
+            # Fetch travel times for physical locations when Maps API key is configured
+            from mint.config import get_settings as _get_settings
+            _maps_key = _get_settings().google_maps_api_key
+            if _maps_key and origin:
+                for enriched_list in (enriched_today, enriched_tomorrow):
+                    travel_tasks = []
+                    travel_indices = []
+                    for i, ev in enumerate(enriched_list):
+                        if ev.travel_info and ev.travel_info.location_type == LocationType.PHYSICAL:
+                            travel_tasks.append(
+                                _maps_get_travel_time(httpx.AsyncClient(), _maps_key, origin, ev.travel_info.original_location, ev.start)
+                            )
+                            travel_indices.append(i)
+                    if travel_tasks:
+                        travel_results = await asyncio.gather(*travel_tasks, return_exceptions=True)
+                        for idx, result_data in zip(travel_indices, travel_results):
+                            if isinstance(result_data, dict):
+                                ti = enriched_list[idx].travel_info
+                                ti.travel_minutes = result_data["duration_minutes"]
+                                ti.travel_mode = "driving"
+                                leave_dt = result_data["leave_by"]
+                                ti.leave_by = _format_local_time(leave_dt, tz) if tz else leave_dt.strftime("%I:%M %p")
+
             pending = [e for e in priority if not e.is_read and e.score >= 0.40]
             action_items = generate_action_items(
                 pending, enriched_tomorrow,
