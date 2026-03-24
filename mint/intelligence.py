@@ -622,7 +622,8 @@ def _extract_location_from_text(text: str) -> str | None:
         return loc_match.group(1).strip()
 
     # "at <Place>" pattern — require capitalized word after "at" to avoid false positives
-    at_match = re.search(r"\bat\s+([A-Z][A-Za-z0-9\s,.'()-]+?)(?:\s*[-\u2014]|\s*$|\.(?:\s|$))", text)
+    # Only match within a single line (use [^\n] instead of \s to avoid crossing lines)
+    at_match = re.search(r"\bat\s+([A-Z][A-Za-z0-9 ,.'()-]+?)(?:\s*[-\u2014]|\s*$|\n|\.(?:\s|$))", text)
     if at_match:
         candidate = at_match.group(1).strip().rstrip(".,")
         if len(candidate) >= 4:
