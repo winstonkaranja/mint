@@ -1,8 +1,40 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 
 from pydantic import BaseModel
+
+
+class LocationType(str, Enum):
+    PHYSICAL = "physical"
+    VIRTUAL = "virtual"
+    ROOM = "room"
+    AMBIGUOUS = "ambiguous"
+
+
+class EventAction(BaseModel):
+    type: str       # "directions" | "rideshare" | "join" | "link"
+    label: str      # "Get Directions" | "Book Uber" | "Join Zoom"
+    url: str
+
+
+class TravelInfo(BaseModel):
+    location_type: LocationType
+    original_location: str
+    meeting_link: str | None = None
+    directions_link: str | None = None
+    directions_link_realtime: str | None = None  # No-origin — uses device GPS
+    uber_deeplink: str | None = None
+    leave_by: str | None = None
+    travel_minutes: int | None = None
+    travel_mode: str | None = None
+
+
+class Highlight(BaseModel):
+    text: str
+    urgency: str = "info"  # "critical" | "high" | "medium" | "info"
+    actions: list[EventAction] = []
 
 
 class ScoringOverrides(BaseModel):
@@ -145,6 +177,8 @@ class EnrichedEvent(BaseModel):
     recurring_event_id: str | None = None
     is_recurring: bool = False
     recurrence_label: str | None = None
+    travel_info: TravelInfo | None = None
+    actions: list[EventAction] = []
 
 
 class DailyBrief(BaseModel):
@@ -152,7 +186,7 @@ class DailyBrief(BaseModel):
     meetings: list[EnrichedEvent]
     priority_emails: list[PriorityEmail]
     pending_thread_count: int
-    highlights: list[str]
+    highlights: list[Highlight]
     timezone: str = "UTC"
 
 
@@ -176,3 +210,14 @@ class WeeklyDigest(BaseModel):
     busiest_day: str | None
     total_meetings: int
     timezone: str = "UTC"
+
+
+class NextDeparture(BaseModel):
+    title: str
+    location: str
+    starts_at: str
+    departs_in_minutes: int | None = None
+    leave_by: str | None = None
+    travel_minutes: int | None = None
+    status: str  # "plenty_of_time" | "leave_soon" | "leaving_now" | "running_late"
+    actions: list[EventAction] = []

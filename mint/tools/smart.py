@@ -1,4 +1,4 @@
-"""Intelligence-gated tools: 10 focused tools backed by server-side scoring and cross-referencing."""
+"""Intelligence-gated tools: 12 focused tools backed by server-side scoring and cross-referencing."""
 
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ from mint.errors import (
 )
 from mint.intelligence import (
     build_relationship_map,
+    build_travel_info,
+    classify_location,
     detect_awaiting_replies,
     enrich_events,
     generate_action_items,
@@ -30,6 +32,7 @@ from mint.intelligence import (
     rank_emails,
     scan_for_sensitive_content,
 )
+from mint.maps import get_travel_time as _maps_get_travel_time
 from mint.models import (
     CalendarEvent,
     CreateEventRequest,
@@ -39,14 +42,25 @@ from mint.models import (
     DraftSummary,
     EmailThread,
     EnrichedEvent,
+    EventAction,
+    LocationType,
+    NextDeparture,
     PriorityEmail,
     ScoringOverrides,
     ThreadMessage,
+    TravelInfo,
     WeeklyDigest,
 )
 from mint.providers.base import CalendarProvider, EmailProvider
 
 _MODULE_START = time.monotonic()
+
+
+def _format_local_time(dt: datetime, tz: ZoneInfo) -> str:
+    """Format a datetime in the given timezone (e.g. '9:00 AM EAT')."""
+    local_dt = dt.astimezone(tz)
+    t = local_dt.strftime("%I:%M %p")
+    return f"{t.lstrip('0')} {local_dt.strftime('%Z')}"
 
 
 def _resolve_timezone(timezone: str) -> ZoneInfo:
@@ -73,6 +87,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     async def get_daily_brief(
         timezone: str = "UTC",
         scoring_overrides: ScoringOverrides | None = None,
+        origin: str | None = None,
         mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
@@ -80,7 +95,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     ) -> DailyBrief:
         """Morning snapshot: today's meetings enriched with related unread emails, top priority emails scored by urgency, and cross-referenced highlights. One call replaces reading inbox + checking calendar.
 
-        Example: get_daily_brief(timezone="Africa/Nairobi") — returns brief with times as "9:00 AM EAT". Pass scoring_overrides to boost/demote specific senders or domains. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
+        Example: get_daily_brief(timezone="Africa/Nairobi") — returns brief with times as "9:00 AM EAT". Pass scoring_overrides to boost/demote specific senders or domains. Pass origin="Westlands, Nairobi" for travel directions to physical meetings. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"timezone": timezone}
         try:
@@ -102,7 +117,35 @@ def register_smart_tools(mcp: FastMCP) -> None:
             priority = rank_emails(emails, events, now_utc, limit=10, overrides=scoring_overrides)
             relationship_map = build_relationship_map(emails)
             today_events = [e for e in events if e.start.date() == now.date()]
-            enriched = enrich_events(today_events, emails, tz=tz, relationship_map=relationship_map)
+            enriched = enrich_events(today_events, emails, tz=tz, relationship_map=relationship_map, origin=origin)
+
+            # Fetch travel times for physical locations when Maps API key is configured
+            from mint.config import get_settings
+            maps_key = get_settings().google_maps_api_key
+            if maps_key and origin:
+                travel_tasks = []
+                travel_indices = []
+                for i, ev in enumerate(enriched):
+                    if ev.travel_info and ev.travel_info.location_type == LocationType.PHYSICAL:
+                        travel_tasks.append(
+                            _maps_get_travel_time(httpx.AsyncClient(), maps_key, origin, ev.travel_info.original_location, ev.start)
+                        )
+                        travel_indices.append(i)
+                if travel_tasks:
+                    travel_results = await asyncio.gather(*travel_tasks, return_exceptions=True)
+                    for idx, result_data in zip(travel_indices, travel_results):
+                        if isinstance(result_data, dict):
+                            ti = enriched[idx].travel_info
+                            ti.travel_minutes = result_data["duration_minutes"]
+                            ti.travel_mode = "driving"
+                            leave_dt = result_data["leave_by"]
+                            if tz:
+                                local_dt = leave_dt.astimezone(tz)
+                                t = local_dt.strftime("%I:%M %p")
+                                ti.leave_by = f"{t.lstrip('0')} {local_dt.strftime('%Z')}"
+                            else:
+                                ti.leave_by = leave_dt.strftime("%I:%M %p")
+
             highlights = generate_highlights(enriched, priority, tz=tz)
 
             # Detect threads awaiting a reply and surface them in highlights
@@ -272,6 +315,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     async def get_upcoming_events(
         days: int = 7,
         timezone: str = "UTC",
+        origin: str | None = None,
         mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
@@ -279,7 +323,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     ) -> list[EnrichedEvent]:
         """Calendar events for the next N days, enriched with unread email counts from attendees. Shows which meetings have related unread emails so you can prepare.
 
-        Example: get_upcoming_events(days=3, timezone="US/Eastern") — next 3 days with times in ET. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
+        Example: get_upcoming_events(days=3, timezone="US/Eastern") — next 3 days with times in ET. Pass origin="Westlands, Nairobi" for travel directions. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"days": days, "timezone": timezone}
         try:
@@ -298,7 +342,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
                 raise provider_error(str(exc)) from exc
 
             relationship_map = build_relationship_map(emails)
-            result = enrich_events(events, emails, tz=tz, relationship_map=relationship_map)
+            result = enrich_events(events, emails, tz=tz, relationship_map=relationship_map, origin=origin)
             log_tool_call("get_upcoming_events", user_email, _params, "success", (time.monotonic() - _start) * 1000)
             return result
         except MintToolError as exc:
@@ -310,12 +354,13 @@ def register_smart_tools(mcp: FastMCP) -> None:
         title: str,
         start: datetime,
         description: str | None = None,
+        location: str | None = None,
         user_email: str | None = Depends(get_user_email),
         calendar_provider: CalendarProvider = Depends(get_calendar_provider),
     ) -> CalendarEvent:
         """Create a personal calendar reminder. Sets a 30-minute event with no attendees. Use for tasks, follow-ups, or prep reminders.
 
-        Example: create_reminder(title="Review Q3 budget", start="2026-03-20T09:00:00", description="Check billing alerts")"""
+        Example: create_reminder(title="Review Q3 budget", start="2026-03-20T09:00:00", description="Check billing alerts", location="KICC, Nairobi")"""
         _start_t = time.monotonic()
         _params = {"title": title, "start": start, "description": description}
         try:
@@ -329,6 +374,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
                 title=title,
                 start=start,
                 end=start + timedelta(minutes=30),
+                location=location,
                 description=description,
                 attendees=[],
             )
@@ -350,6 +396,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     async def summarize_day(
         timezone: str = "UTC",
         scoring_overrides: ScoringOverrides | None = None,
+        origin: str | None = None,
         mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
@@ -357,7 +404,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     ) -> DaySummary:
         """End-of-day summary: emails received, unread count, today's meetings with attendee email activity, pending high-priority emails, tomorrow's first events, and suggested action items.
 
-        Example: summarize_day(timezone="Europe/London") — summary with times in GMT/BST. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
+        Example: summarize_day(timezone="Europe/London") — summary with times in GMT/BST. Pass origin="Westlands, Nairobi" for travel directions. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"timezone": timezone}
         try:
@@ -384,8 +431,31 @@ def register_smart_tools(mcp: FastMCP) -> None:
             all_events = today_events + tomorrow_events
             priority = rank_emails(emails, all_events, now_utc, limit=10, overrides=scoring_overrides)
             relationship_map = build_relationship_map(emails)
-            enriched_today = enrich_events(today_events, emails, tz=tz, relationship_map=relationship_map)
-            enriched_tomorrow = enrich_events(tomorrow_events, emails, tz=tz, relationship_map=relationship_map)
+            enriched_today = enrich_events(today_events, emails, tz=tz, relationship_map=relationship_map, origin=origin)
+            enriched_tomorrow = enrich_events(tomorrow_events, emails, tz=tz, relationship_map=relationship_map, origin=origin)
+
+            # Fetch travel times for physical locations when Maps API key is configured
+            from mint.config import get_settings as _get_settings
+            _maps_key = _get_settings().google_maps_api_key
+            if _maps_key and origin:
+                for enriched_list in (enriched_today, enriched_tomorrow):
+                    travel_tasks = []
+                    travel_indices = []
+                    for i, ev in enumerate(enriched_list):
+                        if ev.travel_info and ev.travel_info.location_type == LocationType.PHYSICAL:
+                            travel_tasks.append(
+                                _maps_get_travel_time(httpx.AsyncClient(), _maps_key, origin, ev.travel_info.original_location, ev.start)
+                            )
+                            travel_indices.append(i)
+                    if travel_tasks:
+                        travel_results = await asyncio.gather(*travel_tasks, return_exceptions=True)
+                        for idx, result_data in zip(travel_indices, travel_results):
+                            if isinstance(result_data, dict):
+                                ti = enriched_list[idx].travel_info
+                                ti.travel_minutes = result_data["duration_minutes"]
+                                ti.travel_mode = "driving"
+                                leave_dt = result_data["leave_by"]
+                                ti.leave_by = _format_local_time(leave_dt, tz) if tz else leave_dt.strftime("%I:%M %p")
 
             pending = [e for e in priority if not e.is_read and e.score >= 0.40]
             action_items = generate_action_items(
@@ -497,6 +567,149 @@ def register_smart_tools(mcp: FastMCP) -> None:
             raise
 
     @mcp.tool(annotations={"readOnlyHint": True})
+    async def get_travel_time(
+        origin: str,
+        destination: str,
+        arrive_by: datetime | None = None,
+        mode: str = "driving",
+        user_email: str | None = Depends(get_user_email),
+    ) -> TravelInfo:
+        """Get travel directions and estimated travel time between two locations. Returns Google Maps link, Uber deep link, and travel time estimate (when Maps API key is configured).
+
+        Example: get_travel_time(origin="Westlands, Nairobi", destination="KICC, Nairobi", arrive_by="2026-03-24T14:00:00", mode="driving")"""
+        _start = time.monotonic()
+        _params = {"origin": origin, "destination": destination, "mode": mode}
+        try:
+            info = build_travel_info(destination, origin=origin)
+
+            # Fetch travel time if Maps API key is configured
+            from mint.config import get_settings
+            maps_key = get_settings().google_maps_api_key
+            if maps_key and info.location_type == LocationType.PHYSICAL and arrive_by:
+                async with httpx.AsyncClient() as client:
+                    result_data = await _maps_get_travel_time(client, maps_key, origin, destination, arrive_by, mode)
+                if result_data:
+                    info.travel_minutes = result_data["duration_minutes"]
+                    info.travel_mode = mode
+                    leave_dt = result_data["leave_by"]
+                    info.leave_by = leave_dt.strftime("%I:%M %p")
+
+            log_tool_call("get_travel_time", user_email, _params, "success", (time.monotonic() - _start) * 1000)
+            return info
+        except MintToolError as exc:
+            log_tool_call("get_travel_time", user_email, _params, "error", (time.monotonic() - _start) * 1000, error_code=exc.error.error_code)
+            raise
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    async def get_next_departure(
+        timezone: str = "UTC",
+        origin: str | None = None,
+        mailbox: str | None = None,
+        user_email: str | None = Depends(get_user_email),
+        calendar_provider: CalendarProvider = Depends(get_calendar_provider),
+    ) -> NextDeparture | dict:
+        """"Am I late?" — returns your next physical meeting with countdown, departure status, and action links. Designed for quick polling.
+
+        Example: get_next_departure(timezone="Africa/Nairobi", origin="Westlands, Nairobi")"""
+        _start = time.monotonic()
+        _params = {"timezone": timezone, "origin": origin}
+        try:
+            tz = _resolve_timezone(timezone)
+            now = datetime.now(tz)
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end = today_start + timedelta(days=1)
+
+            try:
+                events = await calendar_provider.list_events(today_start, today_end, max_results=30, mailbox=mailbox)
+            except httpx.HTTPStatusError as exc:
+                _raise_for_http_error(exc)
+            except Exception as exc:
+                raise provider_error(str(exc)) from exc
+
+            # Find next future event with a physical location
+            from mint.intelligence import build_travel_info, classify_location, _extract_location_from_text
+            next_event = None
+            next_travel = None
+            for event in events:
+                if event.start <= now or event.is_all_day:
+                    continue
+                effective_location = event.location
+                if not effective_location:
+                    fallback_text = f"{event.title}\n{event.description or ''}"
+                    effective_location = _extract_location_from_text(fallback_text)
+                if not effective_location:
+                    continue
+                ti = build_travel_info(effective_location, origin=origin)
+                if ti.location_type == LocationType.PHYSICAL:
+                    next_event = event
+                    next_travel = ti
+                    break
+
+            if not next_event or not next_travel:
+                log_tool_call("get_next_departure", user_email, _params, "success", (time.monotonic() - _start) * 1000)
+                return {"status": "no_physical_meetings_today"}
+
+            starts_at = _format_local_time(next_event.start, tz) if tz else next_event.start.strftime("%I:%M %p")
+
+            # Fetch travel time if Maps API key is configured
+            from mint.config import get_settings
+            maps_key = get_settings().google_maps_api_key
+            departs_in_minutes: int | None = None
+            leave_by_str: str | None = None
+            travel_minutes: int | None = None
+
+            if maps_key and origin:
+                async with httpx.AsyncClient() as client:
+                    result_data = await _maps_get_travel_time(client, maps_key, origin, next_travel.original_location, next_event.start)
+                if result_data:
+                    travel_minutes = result_data["duration_minutes"]
+                    leave_dt = result_data["leave_by"]
+                    if tz:
+                        local_dt = leave_dt.astimezone(tz)
+                        t = local_dt.strftime("%I:%M %p")
+                        leave_by_str = f"{t.lstrip('0')} {local_dt.strftime('%Z')}"
+                    else:
+                        leave_by_str = leave_dt.strftime("%I:%M %p")
+                    departs_in_minutes = int((leave_dt - now).total_seconds() / 60)
+
+            # Determine status
+            if departs_in_minutes is not None:
+                if departs_in_minutes > 30:
+                    status = "plenty_of_time"
+                elif departs_in_minutes > 15:
+                    status = "leave_soon"
+                elif departs_in_minutes > 0:
+                    status = "leaving_now"
+                else:
+                    status = "running_late"
+            else:
+                minutes_to_event = int((next_event.start - now).total_seconds() / 60)
+                status = "plenty_of_time" if minutes_to_event > 30 else "leave_soon"
+
+            actions: list[EventAction] = []
+            link = next_travel.directions_link_realtime or next_travel.directions_link
+            if link:
+                actions.append(EventAction(type="directions", label="Get Directions", url=link))
+            if next_travel.uber_deeplink:
+                actions.append(EventAction(type="rideshare", label="Book Uber", url=next_travel.uber_deeplink))
+
+            result = NextDeparture(
+                title=next_event.title,
+                location=next_travel.original_location,
+                starts_at=starts_at,
+                departs_in_minutes=departs_in_minutes,
+                leave_by=leave_by_str,
+                travel_minutes=travel_minutes,
+                status=status,
+                actions=actions,
+            )
+            log_tool_call("get_next_departure", user_email, _params, "success", (time.monotonic() - _start) * 1000)
+            return result
+        except MintToolError as exc:
+            log_tool_call("get_next_departure", user_email, _params, "error", (time.monotonic() - _start) * 1000, error_code=exc.error.error_code)
+            raise
+
+    @mcp.tool(annotations={"readOnlyHint": True})
     async def server_status() -> dict:
         """Server health and version info accessible through MCP. Returns status, version, uptime, supported providers, tool count, and compliance metadata. Use this to verify the server is running correctly.
 
@@ -510,7 +723,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
             "version": "2.0.0",
             "uptime_seconds": round(time.monotonic() - _MODULE_START),
             "providers": ["google", "microsoft"],
-            "tools_count": 10,
+            "tools_count": 12,
             "compliance": {
                 "encryption_in_transit": "TLS 1.3 (Azure-managed)",
                 "data_at_rest": "none (stateless — no email content persisted)",

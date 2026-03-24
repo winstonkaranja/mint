@@ -7,14 +7,20 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from urllib.parse import quote_plus
+
 from mint.models import (
     AttendeeEmail,
     CalendarEvent,
     EmailSummary,
     EnrichedEvent,
+    EventAction,
+    Highlight,
+    LocationType,
     PrepBundle,
     PriorityEmail,
     ScoringOverrides,
+    TravelInfo,
 )
 
 _EMAIL_RE = re.compile(r"<([^>]+)>")
@@ -529,13 +535,139 @@ def _extract_doc_links(text: str) -> list[str]:
     return list(dict.fromkeys(_DOC_LINK_RE.findall(text)))
 
 
+_VIRTUAL_MEETING_RE = re.compile(
+    r"https?://(?:"
+    r"(?:\w+\.)?zoom\.us|"
+    r"teams\.microsoft\.com/l/meetup-join|"
+    r"meet\.google\.com|"
+    r"(?:\w+\.)?webex\.com|"
+    r"(?:\w+\.)?gotomeeting\.com"
+    r")/[^\s<>\"')]*",
+    re.IGNORECASE,
+)
+_ROOM_KEYWORDS = re.compile(
+    r"\b(?:room|conf(?:erence)?|building|floor|suite|lobby|hall|auditorium)\b",
+    re.IGNORECASE,
+)
+_ADDRESS_RE = re.compile(
+    r"\b\d+\b.*\b(?:st|street|ave|avenue|blvd|boulevard|dr|drive|rd|road|way|ln|lane|ct|court|pl|place|hwy|highway)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_location(location: str) -> LocationType:
+    """Classify a calendar event location string."""
+    if not location or not location.strip():
+        return LocationType.AMBIGUOUS
+    loc = location.strip()
+    if _VIRTUAL_MEETING_RE.search(loc):
+        return LocationType.VIRTUAL
+    if _ADDRESS_RE.search(loc) or "," in loc and len(loc.split(",")) >= 2:
+        return LocationType.PHYSICAL
+    if _ROOM_KEYWORDS.search(loc) and not _ADDRESS_RE.search(loc):
+        return LocationType.ROOM
+    return LocationType.AMBIGUOUS
+
+
+def build_travel_info(
+    location: str,
+    origin: str | None = None,
+) -> TravelInfo:
+    """Build travel info for an event location: classification, links, deep links."""
+    loc_type = classify_location(location)
+
+    meeting_link: str | None = None
+    directions_link: str | None = None
+    directions_link_realtime: str | None = None
+    uber_deeplink: str | None = None
+
+    if loc_type == LocationType.VIRTUAL:
+        match = _VIRTUAL_MEETING_RE.search(location)
+        if match:
+            meeting_link = match.group(0)
+    elif loc_type == LocationType.PHYSICAL:
+        # Always generate GPS-based link (no origin needed — uses device location)
+        directions_link_realtime = (
+            f"https://www.google.com/maps/dir/?api=1"
+            f"&destination={quote_plus(location)}"
+            f"&travelmode=driving"
+        )
+        uber_deeplink = (
+            f"https://m.uber.com/ul/?action=setPickup"
+            f"&dropoff[formatted_address]={quote_plus(location)}"
+        )
+        # Pre-filled origin link for server-side travel time calculation
+        if origin:
+            directions_link = (
+                f"https://www.google.com/maps/dir/?api=1"
+                f"&origin={quote_plus(origin)}"
+                f"&destination={quote_plus(location)}"
+                f"&travelmode=driving"
+            )
+
+    return TravelInfo(
+        location_type=loc_type,
+        original_location=location,
+        meeting_link=meeting_link,
+        directions_link=directions_link,
+        directions_link_realtime=directions_link_realtime,
+        uber_deeplink=uber_deeplink,
+    )
+
+
+def _extract_location_from_text(text: str) -> str | None:
+    """Try to extract a location from event title or description as fallback.
+
+    Looks for:
+    - "at <location>" or "@ <location>" patterns
+    - "Location: <location>" lines
+    - Virtual meeting URLs (Zoom, Teams, Meet, etc.)
+    """
+    # Virtual meeting URLs anywhere in text
+    match = _VIRTUAL_MEETING_RE.search(text)
+    if match:
+        return match.group(0)
+
+    # "Location: ..." line (common in calendar descriptions)
+    loc_match = re.search(r"(?:^|\n)\s*[Ll]ocation\s*:\s*(.+?)(?:\n|$)", text)
+    if loc_match:
+        return loc_match.group(1).strip()
+
+    # "at <Place>" pattern — require capitalized word after "at" to avoid false positives
+    # Only match within a single line (use [^\n] instead of \s to avoid crossing lines)
+    at_match = re.search(r"\bat\s+([A-Z][A-Za-z0-9 ,.'()-]+?)(?:\s*[-\u2014]|\s*$|\n|\.(?:\s|$))", text)
+    if at_match:
+        candidate = at_match.group(1).strip().rstrip(".,")
+        if len(candidate) >= 4:
+            return candidate
+
+    return None
+
+
+def _build_event_actions(travel_info: TravelInfo | None) -> list[EventAction]:
+    """Build clickable actions for an enriched event based on its travel info."""
+    if travel_info is None:
+        return []
+    actions: list[EventAction] = []
+    if travel_info.location_type == LocationType.PHYSICAL:
+        link = travel_info.directions_link_realtime or travel_info.directions_link
+        if link:
+            actions.append(EventAction(type="directions", label="Get Directions", url=link))
+        if travel_info.uber_deeplink:
+            actions.append(EventAction(type="rideshare", label="Book Uber", url=travel_info.uber_deeplink))
+    elif travel_info.location_type == LocationType.VIRTUAL and travel_info.meeting_link:
+        actions.append(EventAction(type="join", label="Join Meeting", url=travel_info.meeting_link))
+    return actions
+
+
 def enrich_events(
     events: list[CalendarEvent],
     emails: list[EmailSummary],
     tz: ZoneInfo | None = None,
     relationship_map: dict[str, int] | None = None,
+    origin: str | None = None,
 ) -> list[EnrichedEvent]:
-    """Attach unread-email counts and prep bundles to each event.
+    """Attach unread-email counts, prep bundles, and travel info to each event.
 
     Each prep bundle contains:
     - Unread emails from attendees (as brief AttendeeEmail summaries)
@@ -545,6 +677,9 @@ def enrich_events(
 
     If *tz* is provided, populates start_local / end_local with
     human-readable times in that timezone (e.g. "9:00 AM EAT").
+
+    If *origin* is provided, physical locations get Google Maps directions
+    links and Uber deep links.
     """
     # Index all emails by sender address for efficient per-attendee lookup
     unread_senders: set[str] = set()
@@ -609,6 +744,18 @@ def enrich_events(
             start_local = _format_local_time(event.start, tz)
             end_local = _format_local_time(event.end, tz)
 
+        # Use explicit location field, or fall back to extracting from title/description
+        effective_location = event.location
+        if not effective_location:
+            fallback_text = f"{event.title}\n{event.description or ''}"
+            effective_location = _extract_location_from_text(fallback_text)
+
+        travel_info = (
+            build_travel_info(effective_location, origin=origin)
+            if effective_location
+            else None
+        )
+
         result.append(
             EnrichedEvent(
                 id=event.id,
@@ -624,6 +771,8 @@ def enrich_events(
                 end_local=end_local,
                 prep_bundle=prep_bundle,
                 recurring_event_id=event.recurring_event_id,
+                travel_info=travel_info,
+                actions=_build_event_actions(travel_info),
             )
         )
 
@@ -661,42 +810,74 @@ def generate_highlights(
     events: list[EnrichedEvent],
     emails: list[PriorityEmail],
     tz: ZoneInfo | None = None,
-) -> list[str]:
-    """Generate natural-language highlights for the daily brief.
+) -> list[Highlight]:
+    """Generate structured highlights for the daily brief.
 
+    Each highlight includes text, urgency level, and optional action links.
     If *tz* is provided, event start times are shown in the user's local
     timezone (e.g. "9:00 AM EAT") instead of raw UTC.
     """
-    highlights: list[str] = []
+    highlights: list[Highlight] = []
 
     # Meeting-related emails
     for event in events:
         if event.unread_from_attendees > 0:
-            if tz is not None:
-                time_str = _format_local_time(event.start, tz)
-            else:
-                time_str = event.start.strftime("%I:%M %p")
-            highlights.append(
-                f"{event.unread_from_attendees} unread email(s) from attendees "
-                f"of \"{event.title}\" (starts {time_str})"
-            )
+            time_str = _format_local_time(event.start, tz) if tz else event.start.strftime("%I:%M %p")
+            highlights.append(Highlight(
+                text=f"{event.unread_from_attendees} unread email(s) from attendees "
+                     f"of \"{event.title}\" (starts {time_str})",
+                urgency="medium",
+            ))
 
     # Schedule conflicts
-    conflicting = [e for e in events if e.conflicts_with]
-    for event in conflicting:
-        others = ", ".join(f'"{t}"' for t in event.conflicts_with)
+    for event in events:
+        if event.conflicts_with:
+            others = ", ".join(f'"{t}"' for t in event.conflicts_with)
+            time_str = _format_local_time(event.start, tz) if tz else event.start.strftime("%I:%M %p")
+            highlights.append(Highlight(
+                text=f'Schedule conflict: "{event.title}" ({time_str}) overlaps with {others}',
+                urgency="high",
+            ))
+
+    # Travel info for physical locations and virtual meetings
+    for event in events:
+        ti = event.travel_info
+        if ti is None:
+            continue
         time_str = _format_local_time(event.start, tz) if tz else event.start.strftime("%I:%M %p")
-        highlights.append(f'Schedule conflict: "{event.title}" ({time_str}) overlaps with {others}')
+        travel_actions = _build_event_actions(ti)
+
+        if ti.location_type == LocationType.PHYSICAL:
+            if ti.leave_by and ti.travel_minutes:
+                highlights.append(Highlight(
+                    text=f'Leave by {ti.leave_by} to reach "{event.title}" at '
+                         f"{ti.original_location} by {time_str} ({ti.travel_minutes} min {ti.travel_mode or 'driving'})",
+                    urgency="high",
+                    actions=travel_actions,
+                ))
+            else:
+                highlights.append(Highlight(
+                    text=f'Your {time_str} "{event.title}" is at {ti.original_location}',
+                    urgency="medium",
+                    actions=travel_actions,
+                ))
+        elif ti.location_type == LocationType.VIRTUAL and ti.meeting_link:
+            highlights.append(Highlight(
+                text=f'"{event.title}" ({time_str}) — join: {ti.meeting_link}',
+                urgency="info",
+                actions=travel_actions,
+            ))
 
     # Top urgent emails
     urgent = [e for e in emails if e.score >= 0.65]
     if urgent:
-        highlights.append(
-            f"{len(urgent)} high-priority email(s) need attention"
-        )
+        highlights.append(Highlight(
+            text=f"{len(urgent)} high-priority email(s) need attention",
+            urgency="high",
+        ))
 
     if not highlights:
-        highlights.append("No urgent items — inbox is under control")
+        highlights.append(Highlight(text="No urgent items — inbox is under control"))
 
     return highlights
 
