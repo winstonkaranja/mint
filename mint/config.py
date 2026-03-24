@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     azure_client_secret: str = ""
     azure_tenant_id: str = ""
 
+    # Google Maps — for travel time estimates in calendar events.
+    # $200/month free credit covers ~40,000 Directions API requests.
+    # When empty, location classification and free links still work.
+    google_maps_api_key: str = ""
+
     # SSO / Enterprise OIDC
     sso_enabled: bool = False
     sso_provider: str | None = None  # "okta", "azure_ad", "google_workspace", or custom

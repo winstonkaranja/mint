@@ -1,4 +1,4 @@
-"""Intelligence-gated tools: 10 focused tools backed by server-side scoring and cross-referencing."""
+"""Intelligence-gated tools: 11 focused tools backed by server-side scoring and cross-referencing."""
 
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ from mint.errors import (
 )
 from mint.intelligence import (
     build_relationship_map,
+    build_travel_info,
+    classify_location,
     detect_awaiting_replies,
     enrich_events,
     generate_action_items,
@@ -30,6 +32,7 @@ from mint.intelligence import (
     rank_emails,
     scan_for_sensitive_content,
 )
+from mint.maps import get_travel_time as _maps_get_travel_time
 from mint.models import (
     CalendarEvent,
     CreateEventRequest,
@@ -39,9 +42,11 @@ from mint.models import (
     DraftSummary,
     EmailThread,
     EnrichedEvent,
+    LocationType,
     PriorityEmail,
     ScoringOverrides,
     ThreadMessage,
+    TravelInfo,
     WeeklyDigest,
 )
 from mint.providers.base import CalendarProvider, EmailProvider
@@ -73,6 +78,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     async def get_daily_brief(
         timezone: str = "UTC",
         scoring_overrides: ScoringOverrides | None = None,
+        origin: str | None = None,
         mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
@@ -80,7 +86,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     ) -> DailyBrief:
         """Morning snapshot: today's meetings enriched with related unread emails, top priority emails scored by urgency, and cross-referenced highlights. One call replaces reading inbox + checking calendar.
 
-        Example: get_daily_brief(timezone="Africa/Nairobi") — returns brief with times as "9:00 AM EAT". Pass scoring_overrides to boost/demote specific senders or domains. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
+        Example: get_daily_brief(timezone="Africa/Nairobi") — returns brief with times as "9:00 AM EAT". Pass scoring_overrides to boost/demote specific senders or domains. Pass origin="Westlands, Nairobi" for travel directions to physical meetings. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"timezone": timezone}
         try:
@@ -102,7 +108,30 @@ def register_smart_tools(mcp: FastMCP) -> None:
             priority = rank_emails(emails, events, now_utc, limit=10, overrides=scoring_overrides)
             relationship_map = build_relationship_map(emails)
             today_events = [e for e in events if e.start.date() == now.date()]
-            enriched = enrich_events(today_events, emails, tz=tz, relationship_map=relationship_map)
+            enriched = enrich_events(today_events, emails, tz=tz, relationship_map=relationship_map, origin=origin)
+
+            # Fetch travel times for physical locations when Maps API key is configured
+            from mint.config import get_settings
+            maps_key = get_settings().google_maps_api_key
+            if maps_key and origin:
+                travel_tasks = []
+                travel_indices = []
+                for i, ev in enumerate(enriched):
+                    if ev.travel_info and ev.travel_info.location_type == LocationType.PHYSICAL:
+                        travel_tasks.append(
+                            _maps_get_travel_time(httpx.AsyncClient(), maps_key, origin, ev.travel_info.original_location, ev.start)
+                        )
+                        travel_indices.append(i)
+                if travel_tasks:
+                    travel_results = await asyncio.gather(*travel_tasks, return_exceptions=True)
+                    for idx, result_data in zip(travel_indices, travel_results):
+                        if isinstance(result_data, dict):
+                            ti = enriched[idx].travel_info
+                            ti.travel_minutes = result_data["duration_minutes"]
+                            ti.travel_mode = "driving"
+                            leave_dt = result_data["leave_by"]
+                            ti.leave_by = _format_local_time(leave_dt, tz) if tz else leave_dt.strftime("%I:%M %p")
+
             highlights = generate_highlights(enriched, priority, tz=tz)
 
             # Detect threads awaiting a reply and surface them in highlights
@@ -272,6 +301,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     async def get_upcoming_events(
         days: int = 7,
         timezone: str = "UTC",
+        origin: str | None = None,
         mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
@@ -279,7 +309,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     ) -> list[EnrichedEvent]:
         """Calendar events for the next N days, enriched with unread email counts from attendees. Shows which meetings have related unread emails so you can prepare.
 
-        Example: get_upcoming_events(days=3, timezone="US/Eastern") — next 3 days with times in ET. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
+        Example: get_upcoming_events(days=3, timezone="US/Eastern") — next 3 days with times in ET. Pass origin="Westlands, Nairobi" for travel directions. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"days": days, "timezone": timezone}
         try:
@@ -298,7 +328,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
                 raise provider_error(str(exc)) from exc
 
             relationship_map = build_relationship_map(emails)
-            result = enrich_events(events, emails, tz=tz, relationship_map=relationship_map)
+            result = enrich_events(events, emails, tz=tz, relationship_map=relationship_map, origin=origin)
             log_tool_call("get_upcoming_events", user_email, _params, "success", (time.monotonic() - _start) * 1000)
             return result
         except MintToolError as exc:
@@ -350,6 +380,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     async def summarize_day(
         timezone: str = "UTC",
         scoring_overrides: ScoringOverrides | None = None,
+        origin: str | None = None,
         mailbox: str | None = None,
         user_email: str | None = Depends(get_user_email),
         email_provider: EmailProvider = Depends(get_email_provider),
@@ -357,7 +388,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
     ) -> DaySummary:
         """End-of-day summary: emails received, unread count, today's meetings with attendee email activity, pending high-priority emails, tomorrow's first events, and suggested action items.
 
-        Example: summarize_day(timezone="Europe/London") — summary with times in GMT/BST. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
+        Example: summarize_day(timezone="Europe/London") — summary with times in GMT/BST. Pass origin="Westlands, Nairobi" for travel directions. Pass mailbox="sales@company.com" to access a shared or delegated mailbox."""
         _start = time.monotonic()
         _params = {"timezone": timezone}
         try:
@@ -384,8 +415,8 @@ def register_smart_tools(mcp: FastMCP) -> None:
             all_events = today_events + tomorrow_events
             priority = rank_emails(emails, all_events, now_utc, limit=10, overrides=scoring_overrides)
             relationship_map = build_relationship_map(emails)
-            enriched_today = enrich_events(today_events, emails, tz=tz, relationship_map=relationship_map)
-            enriched_tomorrow = enrich_events(tomorrow_events, emails, tz=tz, relationship_map=relationship_map)
+            enriched_today = enrich_events(today_events, emails, tz=tz, relationship_map=relationship_map, origin=origin)
+            enriched_tomorrow = enrich_events(tomorrow_events, emails, tz=tz, relationship_map=relationship_map, origin=origin)
 
             pending = [e for e in priority if not e.is_read and e.score >= 0.40]
             action_items = generate_action_items(
@@ -497,6 +528,40 @@ def register_smart_tools(mcp: FastMCP) -> None:
             raise
 
     @mcp.tool(annotations={"readOnlyHint": True})
+    async def get_travel_time(
+        origin: str,
+        destination: str,
+        arrive_by: datetime | None = None,
+        mode: str = "driving",
+        user_email: str | None = Depends(get_user_email),
+    ) -> TravelInfo:
+        """Get travel directions and estimated travel time between two locations. Returns Google Maps link, Uber deep link, and travel time estimate (when Maps API key is configured).
+
+        Example: get_travel_time(origin="Westlands, Nairobi", destination="KICC, Nairobi", arrive_by="2026-03-24T14:00:00", mode="driving")"""
+        _start = time.monotonic()
+        _params = {"origin": origin, "destination": destination, "mode": mode}
+        try:
+            info = build_travel_info(destination, origin=origin)
+
+            # Fetch travel time if Maps API key is configured
+            from mint.config import get_settings
+            maps_key = get_settings().google_maps_api_key
+            if maps_key and info.location_type == LocationType.PHYSICAL and arrive_by:
+                async with httpx.AsyncClient() as client:
+                    result_data = await _maps_get_travel_time(client, maps_key, origin, destination, arrive_by, mode)
+                if result_data:
+                    info.travel_minutes = result_data["duration_minutes"]
+                    info.travel_mode = mode
+                    leave_dt = result_data["leave_by"]
+                    info.leave_by = leave_dt.strftime("%I:%M %p")
+
+            log_tool_call("get_travel_time", user_email, _params, "success", (time.monotonic() - _start) * 1000)
+            return info
+        except MintToolError as exc:
+            log_tool_call("get_travel_time", user_email, _params, "error", (time.monotonic() - _start) * 1000, error_code=exc.error.error_code)
+            raise
+
+    @mcp.tool(annotations={"readOnlyHint": True})
     async def server_status() -> dict:
         """Server health and version info accessible through MCP. Returns status, version, uptime, supported providers, tool count, and compliance metadata. Use this to verify the server is running correctly.
 
@@ -510,7 +575,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
             "version": "2.0.0",
             "uptime_seconds": round(time.monotonic() - _MODULE_START),
             "providers": ["google", "microsoft"],
-            "tools_count": 10,
+            "tools_count": 11,
             "compliance": {
                 "encryption_in_transit": "TLS 1.3 (Azure-managed)",
                 "data_at_rest": "none (stateless — no email content persisted)",

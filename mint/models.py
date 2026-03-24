@@ -1,8 +1,27 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 
 from pydantic import BaseModel
+
+
+class LocationType(str, Enum):
+    PHYSICAL = "physical"
+    VIRTUAL = "virtual"
+    ROOM = "room"
+    AMBIGUOUS = "ambiguous"
+
+
+class TravelInfo(BaseModel):
+    location_type: LocationType
+    original_location: str
+    meeting_link: str | None = None
+    directions_link: str | None = None
+    uber_deeplink: str | None = None
+    leave_by: str | None = None
+    travel_minutes: int | None = None
+    travel_mode: str | None = None
 
 
 class ScoringOverrides(BaseModel):
@@ -145,6 +164,7 @@ class EnrichedEvent(BaseModel):
     recurring_event_id: str | None = None
     is_recurring: bool = False
     recurrence_label: str | None = None
+    travel_info: TravelInfo | None = None
 
 
 class DailyBrief(BaseModel):

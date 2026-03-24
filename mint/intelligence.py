@@ -7,14 +7,18 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from urllib.parse import quote_plus
+
 from mint.models import (
     AttendeeEmail,
     CalendarEvent,
     EmailSummary,
     EnrichedEvent,
+    LocationType,
     PrepBundle,
     PriorityEmail,
     ScoringOverrides,
+    TravelInfo,
 )
 
 _EMAIL_RE = re.compile(r"<([^>]+)>")
@@ -529,13 +533,84 @@ def _extract_doc_links(text: str) -> list[str]:
     return list(dict.fromkeys(_DOC_LINK_RE.findall(text)))
 
 
+_VIRTUAL_MEETING_RE = re.compile(
+    r"https?://(?:"
+    r"(?:\w+\.)?zoom\.us|"
+    r"teams\.microsoft\.com/l/meetup-join|"
+    r"meet\.google\.com|"
+    r"(?:\w+\.)?webex\.com|"
+    r"(?:\w+\.)?gotomeeting\.com"
+    r")/[^\s<>\"')]*",
+    re.IGNORECASE,
+)
+_ROOM_KEYWORDS = re.compile(
+    r"\b(?:room|conf(?:erence)?|building|floor|suite|lobby|hall|auditorium)\b",
+    re.IGNORECASE,
+)
+_ADDRESS_RE = re.compile(
+    r"\b\d+\b.*\b(?:st|street|ave|avenue|blvd|boulevard|dr|drive|rd|road|way|ln|lane|ct|court|pl|place|hwy|highway)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_location(location: str) -> LocationType:
+    """Classify a calendar event location string."""
+    if not location or not location.strip():
+        return LocationType.AMBIGUOUS
+    loc = location.strip()
+    if _VIRTUAL_MEETING_RE.search(loc):
+        return LocationType.VIRTUAL
+    if _ADDRESS_RE.search(loc) or "," in loc and len(loc.split(",")) >= 2:
+        return LocationType.PHYSICAL
+    if _ROOM_KEYWORDS.search(loc) and not _ADDRESS_RE.search(loc):
+        return LocationType.ROOM
+    return LocationType.AMBIGUOUS
+
+
+def build_travel_info(
+    location: str,
+    origin: str | None = None,
+) -> TravelInfo:
+    """Build travel info for an event location: classification, links, deep links."""
+    loc_type = classify_location(location)
+
+    meeting_link: str | None = None
+    directions_link: str | None = None
+    uber_deeplink: str | None = None
+
+    if loc_type == LocationType.VIRTUAL:
+        match = _VIRTUAL_MEETING_RE.search(location)
+        if match:
+            meeting_link = match.group(0)
+    elif loc_type == LocationType.PHYSICAL and origin:
+        directions_link = (
+            f"https://www.google.com/maps/dir/?api=1"
+            f"&origin={quote_plus(origin)}"
+            f"&destination={quote_plus(location)}"
+            f"&travelmode=driving"
+        )
+        uber_deeplink = (
+            f"https://m.uber.com/ul/?action=setPickup"
+            f"&dropoff[formatted_address]={quote_plus(location)}"
+        )
+
+    return TravelInfo(
+        location_type=loc_type,
+        original_location=location,
+        meeting_link=meeting_link,
+        directions_link=directions_link,
+        uber_deeplink=uber_deeplink,
+    )
+
+
 def enrich_events(
     events: list[CalendarEvent],
     emails: list[EmailSummary],
     tz: ZoneInfo | None = None,
     relationship_map: dict[str, int] | None = None,
+    origin: str | None = None,
 ) -> list[EnrichedEvent]:
-    """Attach unread-email counts and prep bundles to each event.
+    """Attach unread-email counts, prep bundles, and travel info to each event.
 
     Each prep bundle contains:
     - Unread emails from attendees (as brief AttendeeEmail summaries)
@@ -545,6 +620,9 @@ def enrich_events(
 
     If *tz* is provided, populates start_local / end_local with
     human-readable times in that timezone (e.g. "9:00 AM EAT").
+
+    If *origin* is provided, physical locations get Google Maps directions
+    links and Uber deep links.
     """
     # Index all emails by sender address for efficient per-attendee lookup
     unread_senders: set[str] = set()
@@ -609,6 +687,12 @@ def enrich_events(
             start_local = _format_local_time(event.start, tz)
             end_local = _format_local_time(event.end, tz)
 
+        travel_info = (
+            build_travel_info(event.location, origin=origin)
+            if event.location
+            else None
+        )
+
         result.append(
             EnrichedEvent(
                 id=event.id,
@@ -624,6 +708,7 @@ def enrich_events(
                 end_local=end_local,
                 prep_bundle=prep_bundle,
                 recurring_event_id=event.recurring_event_id,
+                travel_info=travel_info,
             )
         )
 
@@ -687,6 +772,27 @@ def generate_highlights(
         others = ", ".join(f'"{t}"' for t in event.conflicts_with)
         time_str = _format_local_time(event.start, tz) if tz else event.start.strftime("%I:%M %p")
         highlights.append(f'Schedule conflict: "{event.title}" ({time_str}) overlaps with {others}')
+
+    # Travel info for physical locations
+    for event in events:
+        ti = event.travel_info
+        if ti is None:
+            continue
+        time_str = _format_local_time(event.start, tz) if tz else event.start.strftime("%I:%M %p")
+        if ti.location_type == LocationType.PHYSICAL:
+            if ti.leave_by and ti.travel_minutes:
+                highlights.append(
+                    f'Leave by {ti.leave_by} to reach "{event.title}" at '
+                    f"{ti.original_location} by {time_str} ({ti.travel_minutes} min {ti.travel_mode or 'driving'})"
+                )
+            elif ti.directions_link:
+                highlights.append(
+                    f'Your {time_str} "{event.title}" is at {ti.original_location}'
+                )
+        elif ti.location_type == LocationType.VIRTUAL and ti.meeting_link:
+            highlights.append(
+                f'"{event.title}" ({time_str}) — join: {ti.meeting_link}'
+            )
 
     # Top urgent emails
     urgent = [e for e in emails if e.score >= 0.65]
