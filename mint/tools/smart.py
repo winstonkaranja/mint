@@ -130,7 +130,12 @@ def register_smart_tools(mcp: FastMCP) -> None:
                             ti.travel_minutes = result_data["duration_minutes"]
                             ti.travel_mode = "driving"
                             leave_dt = result_data["leave_by"]
-                            ti.leave_by = _format_local_time(leave_dt, tz) if tz else leave_dt.strftime("%I:%M %p")
+                            if tz:
+                                local_dt = leave_dt.astimezone(tz)
+                                t = local_dt.strftime("%I:%M %p")
+                                ti.leave_by = f"{t.lstrip('0')} {local_dt.strftime('%Z')}"
+                            else:
+                                ti.leave_by = leave_dt.strftime("%I:%M %p")
 
             highlights = generate_highlights(enriched, priority, tz=tz)
 
