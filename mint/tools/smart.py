@@ -1,4 +1,4 @@
-"""Intelligence-gated tools: 12 focused tools backed by server-side scoring and cross-referencing."""
+"""Intelligence-gated tools: 13 focused tools backed by server-side scoring and cross-referencing."""
 
 from __future__ import annotations
 
@@ -283,6 +283,56 @@ def register_smart_tools(mcp: FastMCP) -> None:
             return result
         except MintToolError as exc:
             log_tool_call("draft_email_reply", user_email, _params, "error", (time.monotonic() - _start) * 1000, error_code=exc.error.error_code)
+            raise
+
+    @mcp.tool()
+    async def compose_email(
+        to: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] = [],
+        bcc: list[str] = [],
+        mailbox: str | None = None,
+        user_email: str | None = Depends(get_user_email),
+        email_provider: EmailProvider = Depends(get_email_provider),
+    ) -> str:
+        """Compose a new email draft from scratch. Never sends — the user reviews and sends from their mail client. Returns the draft ID. Body is scanned for sensitive content (SSNs, credit cards, API keys) before drafting.
+
+        Example: compose_email(to=["alice@company.com"], subject="Q3 Budget Review", body="Hi Alice, can we schedule time to review the Q3 budget?"). Pass mailbox="sales@company.com" to draft from a shared mailbox."""
+        _start = time.monotonic()
+        _params = {"to": to, "subject": subject, "body": body, "cc": cc, "bcc": bcc}
+        try:
+            if not to:
+                raise invalid_input("At least one recipient is required", "Provide a non-empty 'to' list")
+            if not subject.strip():
+                raise invalid_input("Subject cannot be empty", "Provide a non-empty subject")
+
+            findings = scan_for_sensitive_content(body)
+            if findings:
+                raise invalid_input(
+                    f"Draft blocked: sensitive content detected \N{EM DASH} {', '.join(findings)}",
+                    "Remove or redact sensitive data before drafting",
+                )
+
+            request = DraftEmailRequest(
+                to=to,
+                subject=subject,
+                body=body,
+                cc=cc,
+                bcc=bcc,
+            )
+
+            try:
+                result = await email_provider.draft_email(request, mailbox=mailbox)
+            except httpx.HTTPStatusError as exc:
+                _raise_for_http_error(exc)
+            except Exception as exc:
+                raise provider_error(str(exc)) from exc
+
+            log_tool_call("compose_email", user_email, _params, "success", (time.monotonic() - _start) * 1000)
+            return result
+        except MintToolError as exc:
+            log_tool_call("compose_email", user_email, _params, "error", (time.monotonic() - _start) * 1000, error_code=exc.error.error_code)
             raise
 
     @mcp.tool(annotations={"readOnlyHint": True})
@@ -674,7 +724,7 @@ def register_smart_tools(mcp: FastMCP) -> None:
             "version": "2.0.0",
             "uptime_seconds": round(time.monotonic() - _MODULE_START),
             "providers": ["google", "microsoft"],
-            "tools_count": 12,
+            "tools_count": 13,
             "compliance": {
                 "encryption_in_transit": "TLS 1.3 (Azure-managed)",
                 "data_at_rest": "none (stateless — no email content persisted)",
