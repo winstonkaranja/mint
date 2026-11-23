@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     azure_client_secret: str = ""
     azure_tenant_id: str = ""
 
+    # Postgres URL for OAuth client/token storage (encrypted with the JWT key). Without it, FastMCP
+    # keeps them on local disk, which a scale-to-zero container loses, forcing users to reconnect.
+    storage_url: str = ""
+
     # Google Maps — for travel time estimates in calendar events.
     # $200/month free credit covers ~40,000 Directions API requests.
     # When empty, location classification and free links still work.
