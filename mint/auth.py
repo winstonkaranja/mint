@@ -182,6 +182,31 @@ class MintTokenVerifier(TokenVerifier):
 # ---------------------------------------------------------------------------
 
 
+MULTI_TENANT = {"common", "organizations", "consumers"}
+
+
+def azure_issuer(tenant: str) -> str | None:
+    """Expected issuer for Microsoft tokens.
+
+    A single-tenant app pins its tenant. A multi-tenant app ("common" etc.) receives tokens issued by
+    each user's own tenant, so the issuer varies; the audience (this app's client id), signature and
+    required mcp-access scope still bind every token to Mint.
+    """
+    return None if tenant in MULTI_TENANT else f"https://login.microsoftonline.com/{tenant}/v2.0"
+
+
+def postgres_client_storage(url: str, encryption_key: str):
+    """Encrypted, restart-proof OAuth storage (clients, tokens) in Postgres."""
+    from key_value.aio.stores.postgresql import PostgreSQLStore
+    from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+
+    return FernetEncryptionWrapper(
+        PostgreSQLStore(url=url, table_name="mint_oauth"),
+        source_material=encryption_key,
+        salt="mint-oauth-storage",
+    )
+
+
 class MintProvider(OAuthProxy):
     """OAuthProxy subclass that lets the user pick Google, Microsoft, or SSO."""
 
@@ -240,7 +265,7 @@ class MintProvider(OAuthProxy):
         tenant = settings.azure_tenant_id
         azure_verifier = JWTVerifier(
             jwks_uri=f"https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys",
-            issuer=f"https://login.microsoftonline.com/{tenant}/v2.0",
+            issuer=azure_issuer(tenant),
             audience=settings.azure_client_id,
             algorithm="RS256",
             required_scopes=["mcp-access"],
@@ -264,6 +289,7 @@ class MintProvider(OAuthProxy):
             token_verifier=verifier,
             base_url=settings.base_url,
             jwt_signing_key=jwt_key,
+            client_storage=postgres_client_storage(settings.storage_url, jwt_key) if settings.storage_url else None,
             require_authorization_consent=True,
             extra_authorize_params=google.extra_authorize_params,
         )
