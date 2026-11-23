@@ -22,7 +22,7 @@ logging.basicConfig(format="%(message)s", level=logging.INFO)
 
 _SERVER_VERSION = "2.0.0"
 _PROVIDERS = ["google", "microsoft"]
-_TOOLS_COUNT = 10
+_TOOLS_COUNT = 13  # keep in step with the @mcp.tool registrations
 _start_time = time.monotonic()
 
 settings = get_settings()
@@ -95,7 +95,7 @@ async def health_check(request: Request) -> JSONResponse:
         "tools_count": _TOOLS_COUNT,
         "compliance": {
             "encryption_in_transit": "TLS 1.3 (Azure-managed)",
-            "data_at_rest": "none (stateless — no email content persisted)",
+            "data_at_rest": "sign-in tokens only, encrypted; no email or calendar content stored",
             "hipaa_ready": True,
             "data_region": settings.data_region,
         },
