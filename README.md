@@ -7,7 +7,7 @@ A hosted MCP server that gives AI assistants access to your email and calendar. 
 Add this URL to your AI client:
 
 ```
-https://mint-app.bravebush-17cab184.eastus.azurecontainerapps.io/mcp
+https://mint.winstonkaranja.me/mcp
 ```
 
 **Claude.ai** — Settings → MCP Servers → Add → paste the URL.
@@ -16,7 +16,7 @@ https://mint-app.bravebush-17cab184.eastus.azurecontainerapps.io/mcp
 
 **Claude Code** —
 ```bash
-claude mcp add mint https://mint-app.bravebush-17cab184.eastus.azurecontainerapps.io/mcp
+claude mcp add mint https://mint.winstonkaranja.me/mcp
 ```
 
 When prompted, choose "Sign in with Google" or "Sign in with Microsoft" and authorize access.
